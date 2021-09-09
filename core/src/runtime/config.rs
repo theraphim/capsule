@@ -153,7 +153,7 @@ impl RuntimeConfig {
         let pcie = Regex::new(r"^\d{4}:\d{2}:\d{2}\.\d$").unwrap();
         self.ports.iter().for_each(|port| {
             if pcie.is_match(port.device.as_str()) {
-                eal_args.push("--pci-whitelist".into());
+                eal_args.push("--allow".into());
                 eal_args.push(port.device.clone());
             } else {
                 let vdev = if let Some(args) = &port.args {
@@ -179,7 +179,7 @@ impl RuntimeConfig {
         }
 
         // adds the main core.
-        eal_args.push("--master-lcore".into());
+        eal_args.push("--main-lcore".into());
         eal_args.push(main.to_string());
 
         // adds all the lcores.
