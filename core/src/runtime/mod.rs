@@ -176,13 +176,33 @@ impl Runtime {
         })
     }
 
-    /// Sets the packet processing pipeline for port.
-    pub fn set_port_pipeline<F>(&self, port: &str, f: F) -> Result<()>
+    /// Sets the packet processing pipeline for port
+    pub fn set_port_pipeline<PipelineFn>(
+        &self,
+        port: &str,
+        pipeline_fn: PipelineFn
+    ) -> Result<()>
+        where
+            PipelineFn: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static
+    {
+        let thread_local_creator_fn = || { () };
+        self.set_port_pipeline_with_thread_locals(port, move |packet, _: &mut ()| { pipeline_fn(packet) }, thread_local_creator_fn)
+    }
+
+    /// Sets the packet processing pipeline for port, optionally taking a function to create thread locals passed to the pipeline
+    pub fn set_port_pipeline_with_thread_locals<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+        &self,
+        port: &str,
+        pipeline_fn: PipelineFn,
+        thread_local_creator_fn: ThreadLocalCreatorFn
+    ) -> Result<()>
     where
-        F: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+        ThreadLocal: Send + 'static,
     {
         let port = self.ports.get(port)?;
-        port.spawn_rx_loops(f, &self.lcores)?;
+        port.spawn_rx_loops(pipeline_fn, thread_local_creator_fn, &self.lcores)?;
         Ok(())
     }
 

@@ -94,9 +94,16 @@ impl Port {
     }
 
     /// Spawns the port receiving loop.
-    pub(crate) fn spawn_rx_loops<F>(&self, f: F, lcores: &LcoreMap) -> Result<()>
+    pub(crate) fn spawn_rx_loops<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+        &self,
+        pipeline_fn: PipelineFn,
+        thread_local_creator_fn: ThreadLocalCreatorFn,
+        lcores: &LcoreMap
+    ) -> Result<()>
     where
-        F: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+        ThreadLocal: Send + 'static
     {
         // port is built with the builder, this would not panic.
         let shutdown = self.shutdown.as_ref().unwrap();
@@ -110,7 +117,8 @@ impl Port {
             let lcore = lcores.get(*lcore_id)?;
             let port_name = self.name.clone();
             let handle = shutdown.get_wait();
-            let f = f.clone();
+            let pipeline_fn = pipeline_fn.clone();
+            let thread_local_creator_fn = thread_local_creator_fn.clone();
 
             debug!(port = ?self.name, lcore = ?lcore.id(), "spawning rx loop.");
 
@@ -121,7 +129,14 @@ impl Port {
                     handle.wait().await;
                     debug!(port = ?port_name, lcore = ?LcoreId::current(), "rx loop exited.");
                 },
-                rx_loop(self.name.clone(), self.port_id, index.into(), 32, f),
+                rx_loop(
+                    self.name.clone(),
+                    self.port_id,
+                    index.into(),
+                    32,
+                    pipeline_fn,
+                    thread_local_creator_fn
+                ),
             ));
         }
 
@@ -224,16 +239,21 @@ impl PortRxQueue {
     }
 }
 
-async fn rx_loop<F>(
+async fn rx_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
     port_name: String,
     port_id: PortId,
     queue_id: PortRxQueueId,
     batch_size: usize,
-    f: F,
+    pipeline_fn: PipelineFn,
+    thread_local_creator_fn: ThreadLocalCreatorFn
 ) where
-    F: Fn(Mbuf) -> Result<Postmark> + Send + Sync + 'static,
+    PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+    ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+    ThreadLocal: Send + 'static
 {
     debug!(port = ?port_name, lcore = ?LcoreId::current(), "executing rx loop.");
+
+    let mut thread_locals = thread_local_creator_fn();
 
     let rxq = PortRxQueue { port_id, queue_id };
     let mut ptrs = Vec::with_capacity(batch_size);
@@ -243,7 +263,7 @@ async fn rx_loop<F>(
         let mut drops = vec![];
 
         for ptr in ptrs.drain(..) {
-            match f(Mbuf::from_easyptr(ptr)) {
+            match pipeline_fn(Mbuf::from_easyptr(ptr), &mut thread_locals) {
                 Ok(Postmark::Emit) => (),
                 Ok(Postmark::Drop(ptr)) => drops.push(ptr),
                 Err(_) => (),
