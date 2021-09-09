@@ -25,6 +25,9 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(unknown_lints)]
+#![allow(deref_nullptr)]
+#![allow(unaligned_references)]
 #![cfg(target_os = "linux")]
 
 #[cfg(not(feature = "rustdoc"))]
