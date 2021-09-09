@@ -161,7 +161,7 @@ impl LcoreId {
     /// Returns the ID of the main lcore.
     #[inline]
     pub(crate) fn main() -> LcoreId {
-        unsafe { LcoreId(cffi::rte_get_master_lcore()) }
+        unsafe { LcoreId(cffi::rte_get_main_lcore()) }
     }
 
     /// Returns the ID of the physical CPU socket of the lcore.
