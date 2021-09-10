@@ -48,7 +48,7 @@ The goal of `Capsule` is to offer an ergonomic framework for network function de
 
 The easiest way to start developing `Capsule` applications is to use the `Vagrant` [virtual machine](https://github.com/capsule-rs/sandbox/blob/master/Vagrantfile) and the `Docker` [sandbox](https://hub.docker.com/repository/docker/getcapsule/sandbox) provided by our team. The sandbox is preconfigured with all the necessary tools and libraries for `Capsule` development, including:
 
-- [`DPDK` 19.11](https://doc.dpdk.org/guides-19.11/rel_notes/release_19_11.html)
+- [`DPDK` 20.11](https://doc.dpdk.org/guides-20.11/rel_notes/release_20_11.html)
 - [`Clang`](https://clang.llvm.org/) and [`LLVM`](https://www.llvm.org/)
 - [`Rust 1.50`](https://blog.rust-lang.org/2021/02/11/Rust-1.50.0.html)
 - [`rr`](https://rr-project.org/) 5.3
