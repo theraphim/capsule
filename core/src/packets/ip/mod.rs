@@ -130,6 +130,16 @@ pub trait IpPacket: Packet {
     /// on a lower layer packet.
     fn set_dst(&mut self, dst: IpAddr) -> Result<()>;
 
+    /// Swaps the source and destination IP addresses
+    ///
+    /// This lets an upper layer packet like TCP swap the IP addresses
+    /// on a lower layer packet.
+    fn swap_addresses(&mut self) -> Result<()> {
+        let src_addr = self.src();
+        self.set_src(self.dst())?;
+        self.set_dst(src_addr)
+    }
+
     /// Returns the pseudo-header for layer 4 checksum computation.
     fn pseudo_header(&self, packet_len: u16, protocol: ProtocolNumber) -> PseudoHeader;
 

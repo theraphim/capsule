@@ -111,6 +111,21 @@ impl<E: IpPacket> Udp<E> {
         self.header_mut().dst_port = dst_port.into();
     }
 
+    /// Swap source and destination ports.
+    #[inline]
+    pub fn swap_ports(&mut self) {
+        let src_port = self.src_port();
+        self.set_src_port(self.dst_port());
+        self.set_dst_port(src_port);
+    }
+
+    /// Swap source and destination ports and addresses of the underlying protocol
+    #[inline]
+    pub fn swap_addresses_and_ports(&mut self) -> Result<()> {
+        self.swap_ports();
+        self.envelope_mut().swap_addresses()
+    }
+
     /// Returns the length in octets of this user datagram including this
     /// header and the data.
     #[inline]

@@ -356,6 +356,13 @@ impl Ipv4 {
     pub fn set_dst(&mut self, dst: Ipv4Addr) {
         self.header_mut().dst = dst;
     }
+
+    /// Swaps the source and destination addresses
+    fn swap_addresses(&mut self) {
+        let src_addr = self.src();
+        self.set_src(self.dst());
+        self.set_dst(src_addr)
+    }
 }
 
 impl fmt::Debug for Ipv4 {
