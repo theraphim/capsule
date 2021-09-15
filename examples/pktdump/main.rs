@@ -17,6 +17,7 @@
 */
 
 use anyhow::{anyhow, Result};
+use capsule::e;
 use capsule::packets::ethernet::{EtherTypes, Ethernet};
 use capsule::packets::ip::v4::Ipv4;
 use capsule::packets::ip::v6::Ipv6;
@@ -33,7 +34,7 @@ use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
 fn dump_pkt(packet: Mbuf) -> Result<Postmark> {
-    let ethernet = packet.parse::<Ethernet>()?;
+    let ethernet = e!(packet.parse::<Ethernet>());
 
     let fmt = format!("{:?}", ethernet).magenta().bold();
     info!("{}", fmt);

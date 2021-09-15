@@ -22,7 +22,7 @@ use crate::ensure;
 use crate::net::MacAddr;
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Mbuf, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -277,10 +277,13 @@ impl Packet for Ethernet {
     /// Returns an error if the `Ethernet` header is larger than the data
     /// payload.
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         let packet = Ethernet {
             envelope,
@@ -294,7 +297,7 @@ impl Packet for Ethernet {
         // header will cause a panic.
         ensure!(
             packet.mbuf().data_len() >= packet.header_len(),
-            anyhow!("header size exceeds remaining buffer size.")
+            (anyhow!("header size exceeds remaining buffer size."), packet.deparse())
         );
 
         Ok(packet)

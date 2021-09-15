@@ -24,7 +24,7 @@ use crate::packets::ethernet::{EtherTypes, Ethernet};
 use crate::packets::ip::{IpPacket, ProtocolNumber, DEFAULT_IP_TTL};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::ptr::NonNull;
@@ -425,15 +425,18 @@ impl Packet for Ipv4 {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Ipv4`]: EtherTypes::Ipv4
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.ether_type() == EtherTypes::Ipv4,
-            anyhow!("not an IPv4 packet.")
+            (anyhow!("not an IPv4 packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         Ok(Ipv4 {
             envelope,

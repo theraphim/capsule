@@ -37,7 +37,7 @@ use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::ip::ProtocolNumbers;
 use crate::packets::types::u16be;
 use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -144,10 +144,10 @@ impl<E: Ipv6Packet> Icmpv6<E> {
     /// Returns an error if the message type in the packet header does not
     /// match the assigned message type for `T`.
     #[inline]
-    pub fn downcast<T: Icmpv6Message<Envelope = E>>(self) -> Result<T> {
+    pub fn downcast<T: Icmpv6Message<Envelope = E>>(self) -> Result<T, (Error, Self)> {
         ensure!(
             self.msg_type() == T::msg_type(),
-            anyhow!("the ICMPv6 packet is not {}.", T::msg_type())
+            (anyhow!("the ICMPv6 packet is not {}.", T::msg_type()), self)
         );
 
         T::try_parse(self, Internal(()))
@@ -214,15 +214,18 @@ impl<E: Ipv6Packet> Packet for Icmpv6<E> {
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     /// [`ProtocolNumbers::Icmpv6`]: crate::packets::ip::ProtocolNumbers::Icmpv6
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.next_protocol() == ProtocolNumbers::Icmpv6,
-            anyhow!("not an ICMPv6 packet.")
+            (anyhow!("not an ICMPv6 packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         Ok(Icmpv6 {
             envelope,
@@ -420,7 +423,7 @@ pub trait Icmpv6Message {
     ///
     /// [`Icmpv6::downcast`]: Icmpv6::downcast
     /// [`msg_type`]: Icmpv6::msg_type
-    fn try_parse(icmp: Icmpv6<Self::Envelope>, internal: Internal) -> Result<Self>
+    fn try_parse(icmp: Icmpv6<Self::Envelope>, internal: Internal) -> Result<Self, (Error, Icmpv6<Self::Envelope>)>
     where
         Self: Sized;
 

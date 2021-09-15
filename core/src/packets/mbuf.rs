@@ -20,7 +20,7 @@ use crate::ffi::dpdk::{self, MbufPtr};
 use crate::packets::{Internal, Packet, SizeOf};
 use crate::runtime::Mempool;
 use crate::{ensure, trace};
-use anyhow::Result;
+use anyhow::{Result, Error};
 use capsule_ffi as cffi;
 use std::fmt;
 use std::mem;
@@ -468,7 +468,7 @@ impl Packet for Mbuf {
     }
 
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         Ok(envelope)
     }
 

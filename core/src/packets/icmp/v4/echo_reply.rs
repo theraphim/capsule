@@ -19,7 +19,7 @@
 use crate::packets::icmp::v4::{Icmpv4, Icmpv4Message, Icmpv4Packet, Icmpv4Type, Icmpv4Types};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::Result;
+use anyhow::{Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -178,10 +178,13 @@ impl Icmpv4Message for EchoReply {
     /// Returns an error if the payload does not have sufficient data for
     /// the echo reply message body.
     #[inline]
-    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self> {
+    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self, (Error, Icmpv4)> {
         let mbuf = icmp.mbuf();
         let offset = icmp.payload_offset();
-        let body = mbuf.read_data(offset)?;
+        let body = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, icmp)),
+            Ok(body) => body
+        };
 
         Ok(EchoReply { icmp, body })
     }

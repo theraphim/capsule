@@ -33,7 +33,7 @@ pub use self::mbuf::*;
 pub use self::size_of::*;
 pub use capsule_macros::SizeOf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, Error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -50,6 +50,28 @@ use std::ops::Deref;
 /// [`PacketBase::clone`]: PacketBase::clone
 #[derive(Clone, Debug)]
 pub struct Internal(());
+
+/// A macro to return from the current function with the actual error from a
+/// `Result<T, (Error, T::Envelope)>` commonly found in `packet.parse<T>()`
+///
+/// # Example
+///
+/// ```
+/// fn to_ipv4(packet: Mbuf) -> Result<Ipv4> {
+///     packet.parse::<Ethernet>().e().parse::<Ipv4>().e()
+/// }
+/// ```
+#[macro_export]
+macro_rules! e {
+    ($expr:expr $(,)?) => {
+        match $expr {
+            anyhow::Result::Ok(val) => val,
+            anyhow::Result::Err((err, _)) => {
+                return anyhow::Result::Err(err);
+            }
+        }
+    };
+}
 
 /// A trait all network protocols must implement.
 ///
@@ -165,7 +187,7 @@ pub trait Packet {
     /// [IPv4]: ip::v4::Ipv4
     /// [`ether_type`]: Ethernet::ether_type
     /// [`parse`]: Packet::parse
-    fn try_parse(envelope: Self::Envelope, internal: Internal) -> Result<Self>
+    fn try_parse(envelope: Self::Envelope, internal: Internal) -> Result<Self, (Error, Self::Envelope)>
     where
         Self: Sized;
 
@@ -176,7 +198,7 @@ pub trait Packet {
     ///
     /// [`peek`]: Packet::peek
     #[inline]
-    fn parse<T: Packet<Envelope = Self>>(self) -> Result<T>
+    fn parse<T: Packet<Envelope = Self>>(self) -> Result<T, (Error, Self)>
     where
         Self: Sized,
     {
@@ -193,7 +215,7 @@ pub trait Packet {
         Self: Sized,
     {
         let clone = unsafe { self.clone(Internal(())) };
-        clone.parse::<T>().map(Immutable::new)
+        clone.parse::<T>().map(Immutable::new).map_err(|e| e.0)
     }
 
     /// Prepends a new packet to the beginning of the envelope's payload.

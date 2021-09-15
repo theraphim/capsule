@@ -24,7 +24,7 @@ use crate::packets::ip::v6::Ipv6;
 use crate::packets::ip::{Flow, IpPacket, ProtocolNumbers};
 use crate::packets::types::{u16be, u32be};
 use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::IpAddr;
 use std::ptr::NonNull;
@@ -557,15 +557,18 @@ impl<E: IpPacket> Packet for Tcp<E> {
     /// [`ProtocolNumbers::Tcp`]: crate::packets::ip::ProtocolNumbers::Tcp
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.next_protocol() == ProtocolNumbers::Tcp,
-            anyhow!("not a TCP packet.")
+            (anyhow!("not a TCP packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         Ok(Tcp {
             envelope,

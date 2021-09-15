@@ -22,7 +22,7 @@ use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::ip::{IpPacket, ProtocolNumber, ProtocolNumbers};
 use crate::packets::types::{u16be, u32be};
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::IpAddr;
 use std::ptr::NonNull;
@@ -184,15 +184,18 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Frag`]: ProtocolNumbers::Ipv6Frag
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.next_header() == ProtocolNumbers::Ipv6Frag,
-            anyhow!("not an IPv6 fragment packet.")
+            (anyhow!("not an IPv6 fragment packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         Ok(Fragment {
             envelope,

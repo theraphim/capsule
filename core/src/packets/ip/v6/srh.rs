@@ -22,7 +22,7 @@ use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::ip::{IpPacket, ProtocolNumber, ProtocolNumbers};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ptr::NonNull;
@@ -296,24 +296,30 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Route`]: ProtocolNumbers::Ipv6Route
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.next_header() == ProtocolNumbers::Ipv6Route,
-            anyhow!("not an IPv6 routing packet.")
+            (anyhow!("not an IPv6 routing packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data::<SegmentRoutingHeader>(offset)?;
+        let header = match mbuf.read_data::<SegmentRoutingHeader>(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         let hdr_ext_len = unsafe { header.as_ref().hdr_ext_len };
         let segments_len = unsafe { header.as_ref().last_entry + 1 };
 
         if hdr_ext_len != 0 && (2 * segments_len == hdr_ext_len) {
-            let segments = mbuf.read_data_slice::<Ipv6Addr>(
+            let segments = match mbuf.read_data_slice::<Ipv6Addr>(
                 offset + SegmentRoutingHeader::size_of(),
                 segments_len as usize,
-            )?;
+            ) {
+                Err(e) => return Err((e, envelope)),
+                Ok(segments) => segments
+            };
 
             Ok(SegmentRouting {
                 envelope,
@@ -322,7 +328,7 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
                 offset,
             })
         } else {
-            Err(anyhow!("Packet has inconsistent segment list length."))
+            Err((anyhow!("Packet has inconsistent segment list length."), envelope))
         }
     }
 

@@ -23,7 +23,7 @@ use crate::net::MacAddr;
 use crate::packets::ethernet::{EtherTypes, Ethernet};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::ptr::NonNull;
@@ -290,15 +290,18 @@ impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Arp`]: EtherTypes::Arp
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.ether_type() == EtherTypes::Arp,
-            anyhow!("not an ARP packet.")
+            (anyhow!("not an ARP packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         let packet = Arp {
             envelope,
@@ -308,35 +311,35 @@ impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
 
         ensure!(
             packet.hardware_type() == H::addr_type(),
-            anyhow!(
+            (anyhow!(
                 "hardware type {} does not match expected {}.",
                 packet.hardware_type(),
-                H::addr_type()
-            )
+                H::addr_type(),
+            ), packet.deparse())
         );
         ensure!(
             packet.protocol_type() == P::addr_type(),
-            anyhow!(
+            (anyhow!(
                 "protocol type {} does not match expected {}.",
                 packet.protocol_type(),
                 P::addr_type()
-            )
+            ), packet.deparse())
         );
         ensure!(
             packet.hardware_addr_len() == H::size_of() as u8,
-            anyhow!(
+            (anyhow!(
                 "hardware address length {} does not match expected {}.",
                 packet.hardware_addr_len(),
                 H::size_of()
-            )
+            ), packet.deparse())
         );
         ensure!(
             packet.protocol_addr_len() == P::size_of() as u8,
-            anyhow!(
+            (anyhow!(
                 "protocol address length {} does not match expected {}.",
                 packet.protocol_addr_len(),
                 P::size_of()
-            )
+            ), packet.deparse())
         );
 
         Ok(packet)

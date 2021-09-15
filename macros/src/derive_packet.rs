@@ -74,8 +74,8 @@ pub fn gen_icmpv6(input: syn::DeriveInput) -> TokenStream {
             }
 
             #[inline]
-            fn try_parse(envelope: Self::Envelope, _internal: Internal) -> ::anyhow::Result<Self> {
-                envelope.parse::<::capsule::packets::icmp::v6::Icmpv6<E>>()?.downcast::<#name<E>>()
+            fn try_parse(envelope: Self::Envelope, _internal: Internal) -> ::anyhow::Result<Self, (Error, Self::Envelope)> {
+                envelope.parse::<::capsule::packets::icmp::v6::Icmpv6<E>>()?.downcast::<#name<E>>().map_err(|(e, env)| (e, env.deparse()))
             }
 
             #[inline]
@@ -173,8 +173,8 @@ pub fn gen_icmpv4(input: syn::DeriveInput) -> TokenStream {
             }
 
             #[inline]
-            fn try_parse(envelope: Self::Envelope, _internal: ::capsule::packets::Internal) -> ::anyhow::Result<Self> {
-                envelope.parse::<::capsule::packets::icmp::v4::Icmpv4>()?.downcast::<#name>()
+            fn try_parse(envelope: Self::Envelope, _internal: ::capsule::packets::Internal) -> ::anyhow::Result<Self, (Error, Self::Envelope)> {
+                envelope.parse::<::capsule::packets::icmp::v4::Icmpv4>()?.downcast::<#name>().map_err(|(e, env)| (e, env.deparse()))
             }
 
             #[inline]

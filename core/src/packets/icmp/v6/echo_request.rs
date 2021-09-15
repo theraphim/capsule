@@ -20,7 +20,7 @@ use crate::packets::icmp::v6::{Icmpv6, Icmpv6Message, Icmpv6Packet, Icmpv6Type, 
 use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::Result;
+use anyhow::{Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -182,10 +182,13 @@ impl<E: Ipv6Packet> Icmpv6Message for EchoRequest<E> {
     /// Returns an error if the payload does not have sufficient data for
     /// the echo request message body.
     #[inline]
-    fn try_parse(icmp: Icmpv6<Self::Envelope>, _internal: Internal) -> Result<Self> {
+    fn try_parse(icmp: Icmpv6<Self::Envelope>, _internal: Internal) -> Result<Self, (Error, Icmpv6<Self::Envelope>)> {
         let mbuf = icmp.mbuf();
         let offset = icmp.payload_offset();
-        let body = mbuf.read_data(offset)?;
+        let body = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, icmp)),
+            Ok(body) => body
+        };
 
         Ok(EchoRequest { icmp, body })
     }

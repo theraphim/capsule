@@ -34,7 +34,7 @@ use crate::packets::ip::v4::Ipv4;
 use crate::packets::ip::ProtocolNumbers;
 use crate::packets::types::u16be;
 use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -135,10 +135,10 @@ impl Icmpv4 {
     /// Returns an error if the message type in the packet header does not
     /// match the assigned message type for `T`.
     #[inline]
-    pub fn downcast<T: Icmpv4Message>(self) -> Result<T> {
+    pub fn downcast<T: Icmpv4Message>(self) -> Result<T, (Error, Self)> {
         ensure!(
             self.msg_type() == T::msg_type(),
-            anyhow!("the ICMPv4 packet is not {}.", T::msg_type())
+            (anyhow!("the ICMPv4 packet is not {}.", T::msg_type()), self)
         );
 
         T::try_parse(self, Internal(()))
@@ -202,15 +202,18 @@ impl Packet for Icmpv4 {
     /// [`Ipv4::protocol`]: crate::packets::ip::v4::Ipv4::protocol
     /// [`ProtocolNumbers::Icmpv4`]: crate::packets::ip::ProtocolNumbers::Icmpv4
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
         ensure!(
             envelope.protocol() == ProtocolNumbers::Icmpv4,
-            anyhow!("not an ICMPv4 packet.")
+            (anyhow!("not an ICMPv4 packet."), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
-        let header = mbuf.read_data(offset)?;
+        let header = match mbuf.read_data(offset) {
+            Err(e) => return Err((e, envelope)),
+            Ok(header) => header
+        };
 
         Ok(Icmpv4 {
             envelope,
@@ -368,7 +371,7 @@ pub trait Icmpv4Message {
     ///
     /// [`Icmpv4::downcast`]: Icmpv4::downcast
     /// [`msg_type`]: Icmpv4::msg_type
-    fn try_parse(icmp: Icmpv4, internal: Internal) -> Result<Self>
+    fn try_parse(icmp: Icmpv4, internal: Internal) -> Result<Self, (Error, Icmpv4)>
     where
         Self: Sized;
 

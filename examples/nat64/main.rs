@@ -18,6 +18,7 @@
 
 use anyhow::Result;
 use bimap::BiMap;
+use capsule::e;
 use capsule::net::MacAddr;
 use capsule::packets::ethernet::Ethernet;
 use capsule::packets::ip::v4::Ipv4;
@@ -69,8 +70,8 @@ fn nat_6to4(packet: Mbuf, cap1: &Outbox) -> Result<Postmark> {
     const SRC_IP: Ipv4Addr = Ipv4Addr::new(10, 100, 1, 11);
     const DST_MAC: MacAddr = MacAddr::new(0x02, 0x00, 0x00, 0xff, 0xff, 0xff);
 
-    let ethernet = packet.parse::<Ethernet>()?;
-    let v6 = ethernet.parse::<Ipv6>()?;
+    let ethernet = e!(packet.parse::<Ethernet>());
+    let v6 = e!(ethernet.parse::<Ipv6>());
 
     if v6.next_header() == ProtocolNumbers::Tcp {
         let dscp = v6.dscp();
@@ -93,7 +94,7 @@ fn nat_6to4(packet: Mbuf, cap1: &Outbox) -> Result<Postmark> {
         v4.set_src(SRC_IP);
         v4.set_dst(dst_ip);
 
-        let mut tcp = v4.parse::<Tcp4>()?;
+        let mut tcp = e!(v4.parse::<Tcp4>());
         let port = tcp.src_port();
         tcp.set_src_port(get_v4_port(src_mac, src_ip, port));
         tcp.reconcile_all();
@@ -136,8 +137,8 @@ fn get_v6_dst(port: u16) -> Option<(MacAddr, Ipv6Addr, u16)> {
 }
 
 fn nat_4to6(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
-    let ethernet = packet.parse::<Ethernet>()?;
-    let v4 = ethernet.parse::<Ipv4>()?;
+    let ethernet = e!(packet.parse::<Ethernet>());
+    let v4 = e!(ethernet.parse::<Ipv4>());
 
     if v4.protocol() == ProtocolNumbers::Tcp && v4.fragment_offset() == 0 && !v4.more_fragments() {
         let tcp = v4.peek::<Tcp4>()?;
@@ -161,7 +162,7 @@ fn nat_4to6(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
             v6.set_src(src_ip);
             v6.set_dst(dst_ip);
 
-            let mut tcp = v6.parse::<Tcp6>()?;
+            let mut tcp = e!(v6.parse::<Tcp6>());
             tcp.set_dst_port(port);
             tcp.reconcile_all();
 

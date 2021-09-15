@@ -17,6 +17,7 @@
 */
 
 use anyhow::Result;
+use capsule::e;
 use capsule::packets::ethernet::Ethernet;
 use capsule::packets::icmp::v6::Icmpv6;
 use capsule::packets::ip::v6::{Ipv6, Ipv6Packet};
@@ -34,18 +35,18 @@ use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
 fn route_pkt(packet: Mbuf, kni0: &Outbox) -> Result<Postmark> {
-    let ipv6 = packet.parse::<Ethernet>()?.parse::<Ipv6>()?;
+    let ipv6 = e!(e!(packet.parse::<Ethernet>()).parse::<Ipv6>());
 
     match ipv6.next_header() {
         ProtocolNumbers::Icmpv6 => {
-            let icmp = ipv6.parse::<Icmpv6<Ipv6>>()?;
+            let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
             let fmt = format!("to kni0: {}", icmp.msg_type()).cyan();
             info!("{}", fmt);
             let _ = kni0.push(icmp);
             Ok(Postmark::Emit)
         }
         ProtocolNumbers::Udp => {
-            let udp = ipv6.parse::<Udp6>()?;
+            let udp = e!(ipv6.parse::<Udp6>());
             let fmt = format!("you said: {}", str::from_utf8(udp.data())?).bright_blue();
             info!("{}", fmt);
             Ok(Postmark::Drop(udp.reset()))
@@ -59,10 +60,9 @@ fn route_pkt(packet: Mbuf, kni0: &Outbox) -> Result<Postmark> {
 }
 
 fn from_kni(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
-    let icmp = packet
-        .parse::<Ethernet>()?
-        .parse::<Ipv6>()?
-        .parse::<Icmpv6<Ipv6>>()?;
+    let ethernet = e!(packet.parse::<Ethernet>());
+    let ipv6 = e!(ethernet.parse::<Ipv6>());
+    let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
 
     let fmt = format!("from kni0: {}", icmp.msg_type()).green();
     info!("{}", fmt);
