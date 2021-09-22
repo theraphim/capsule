@@ -86,6 +86,10 @@ pub struct RuntimeConfig {
     /// execution.
     pub worker_cores: Vec<usize>,
 
+    /// Turn on symmetric RSS so that packets belonging to the same connection in both directions
+    /// end up in the same queue
+    pub symmetric_rss: Option<bool>,
+
     /// The root data directory the application writes to.
     ///
     /// If unset, the default is `/var/capsule/{app_name}`.

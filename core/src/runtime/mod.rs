@@ -147,7 +147,7 @@ impl Runtime {
                 .set_rxqs_txqs(port.rxqs, port.txqs)?
                 .set_promiscuous(port.promiscuous)?
                 .set_multicast(port.multicast)?
-                .set_rx_lcores(port.rx_cores.clone())?
+                .set_rx_lcores(port.rx_cores.clone(), config.symmetric_rss.unwrap_or(false))?
                 .set_tx_lcores(port.tx_cores.clone())?
                 .build(&mut mempool)?;
 
