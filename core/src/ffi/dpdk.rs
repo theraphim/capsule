@@ -371,7 +371,6 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
         mask: ptr::null()
     });
     // Create config for RSS action type
-    let queue_idx = (0..num_queues).map(|idx| idx as u16).collect::<Vec<_>>();
     let flow_action_rss_conf = cffi::rte_flow_action_rss {
         func: cffi::rte_eth_hash_function::RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ,
         level: 0,
@@ -379,7 +378,7 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
         key_len: 0,
         queue_num: num_queues as u32,
         key: ptr::null(),
-        queue: queue_idx.as_ptr()
+        queue: ptr::null()
     };
     // Creation action items
     let flow_action_rss_conf_ptr: *const cffi::rte_flow_action_rss = &flow_action_rss_conf;
