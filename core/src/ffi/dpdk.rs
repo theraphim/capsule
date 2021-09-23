@@ -438,7 +438,8 @@ pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<(
         (cffi::ETH_RSS_IPV6 | cffi::ETH_RSS_FRAG_IPV6 | cffi::ETH_RSS_NONFRAG_IPV6_OTHER | cffi::ETH_RSS_IPV6_EX,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
     ];
-    for (rss_hf, protos) in specs {
+    for (rss_hf, mut protos) in specs {
+        protos.insert(0, cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_ETH);
         eth_sym_rss_flow_rule_create(port_id, rss_hf as u64, protos, num_queues)?;
     }
     Ok(())
