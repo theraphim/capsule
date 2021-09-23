@@ -351,15 +351,25 @@ pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
     }
 }
 
-/// Enables symmetric RSS for a device
-pub(crate) fn eth_sym_rss_enable(port_id: PortId, rss_hf: u64, num_queues: usize) -> Result<()> {
+/// Creates a symmetric RSS flow rule for a device with a specific protocol match and RSS type
+fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<cffi::rte_flow_item_type::Type>, num_queues: usize) -> Result<&'static cffi::rte_flow> {
     // Create pattern items
-    let flow_item_end = cffi::rte_flow_item {
+    let mut flow_items: Vec<cffi::rte_flow_item> = Vec::new();
+    for proto in &proto_stack {
+        flow_items.push(cffi::rte_flow_item {
+            type_: proto.clone(),
+            spec: ptr::null(),
+            last: ptr::null(),
+            mask: ptr::null()
+        })
+    }
+    // Push end item
+    flow_items.push(cffi::rte_flow_item {
         type_: cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_END,
         spec: ptr::null(),
         last: ptr::null(),
         mask: ptr::null()
-    };
+    });
     // Create config for RSS action type
     let queue_idx = (0..num_queues).map(|idx| idx as u16).collect::<Vec<_>>();
     let flow_action_rss_conf = cffi::rte_flow_action_rss {
@@ -381,7 +391,6 @@ pub(crate) fn eth_sym_rss_enable(port_id: PortId, rss_hf: u64, num_queues: usize
         type_: cffi::rte_flow_action_type::RTE_FLOW_ACTION_TYPE_END,
         conf: ptr::null()
     };
-    let flow_items = [flow_item_end];
     let flow_actions = [flow_action_rss, flow_action_end];
     let flow_attr = cffi::rte_flow_attr {
         group: 0,
@@ -390,19 +399,49 @@ pub(crate) fn eth_sym_rss_enable(port_id: PortId, rss_hf: u64, num_queues: usize
         _bitfield_1: cffi::rte_flow_attr::new_bitfield_1(1, 0, 0, 0)
     };
     let mut flow_error_uninit = MaybeUninit::<cffi::rte_flow_error>::uninit();
-    let _flow_rule = match unsafe { cffi::rte_flow_create(port_id.0,
-                                                             &flow_attr,
-                                                             flow_items.as_ptr(),
-                                                             flow_actions.as_ptr(),
-                                                             flow_error_uninit.as_mut_ptr()).as_ref() } {
-        Some(flow_rule) => flow_rule,
+    match unsafe { cffi::rte_flow_create(port_id.0,
+                                                          &flow_attr,
+                                                          flow_items.as_ptr(),
+                                                          flow_actions.as_ptr(),
+                                                          flow_error_uninit.as_mut_ptr()).as_ref() } {
+        Some(flow_rule) => Ok(flow_rule),
         None => {
             let rte_error = DpdkError::new();
             let flow_error = unsafe { flow_error_uninit.assume_init() };
-            return Err(anyhow!("Symmetric RSS flow rule create failed: {}, detail: {} ({})", rte_error, flow_error.message.as_str(), flow_error.type_))
+            Err(anyhow!("Symmetric RSS flow rule for RSS type(s) '{:?}' and protocol stack '{:?}' create failed: {}, detail: {} ({})", rss_hf, proto_stack, rte_error, flow_error.message.as_str(), flow_error.type_))
         }
-    };
+    }
+}
 
+/// Enables symmetric RSS for a device
+pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<()> {
+    let specs = vec![
+        // IPv4 UDP
+        (cffi::ETH_RSS_NONFRAG_IPV4_UDP,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
+              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
+        // IPv4 TCP
+        (cffi::ETH_RSS_NONFRAG_IPV4_TCP,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
+              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
+        // IPv4
+        (cffi::ETH_RSS_IPV4 | cffi::ETH_RSS_FRAG_IPV4 | cffi::ETH_RSS_NONFRAG_IPV4_OTHER,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4]),
+        // IPv6 UDP
+        (cffi::ETH_RSS_NONFRAG_IPV6_UDP | cffi::ETH_RSS_IPV6_UDP_EX,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
+              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
+        // IPv6 TCP
+        (cffi::ETH_RSS_NONFRAG_IPV6_TCP | cffi::ETH_RSS_IPV6_TCP_EX,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
+              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
+        // IPv6
+        (cffi::ETH_RSS_IPV6 | cffi::ETH_RSS_FRAG_IPV6 | cffi::ETH_RSS_NONFRAG_IPV6_OTHER | cffi::ETH_RSS_IPV6_EX,
+         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
+    ];
+    for (rss_hf, protos) in specs {
+        eth_sym_rss_flow_rule_create(port_id, rss_hf as u64, protos, num_queues)?;
+    }
     Ok(())
 }
 

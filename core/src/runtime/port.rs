@@ -452,10 +452,6 @@ impl Builder {
         })
     }
 
-    const RSS_HF: u64 =
-        (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
-            as u64;
-
     /// Sets the lcores to receive packets on.
     ///
     /// Enables receive side scaling if more than one lcore is used for RX or
@@ -472,10 +468,13 @@ impl Builder {
         );
 
         if lcores.len() > 1 {
+            const RSS_HF: u64 =
+                (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
+                    as u64;
             // enables receive side scaling.
             self.port_conf.rxmode.mq_mode = cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS;
             self.port_conf.rx_adv_conf.rss_conf.rss_hf =
-                self.port_info.flow_type_rss_offloads & Self::RSS_HF;
+                self.port_info.flow_type_rss_offloads & RSS_HF;
 
             debug!(
                 port = ?self.name,
@@ -632,7 +631,6 @@ impl Builder {
         // configures symmetric RSS (this has to be done after configuring the port so the max queue size is known)
         if self.symmetric_rss {
             dpdk::eth_sym_rss_enable(self.port_id,
-                                     self.port_info.flow_type_rss_offloads & Self::RSS_HF,
                                      self.rx_lcores.len())?;
         }
 
@@ -746,7 +744,7 @@ mod tests {
     fn symmetric_rss() -> Result<()> {
         let rx_lcores = (0..2).collect::<Vec<_>>();
         let tx_lcores = (3..6).collect::<Vec<_>>();
-        let mut pool = Mempool::new("mp_build_port", 15, 0, SocketId::ANY)?;
+        let mut pool = Mempool::new("mp_build_port_sym_rss", 15, 0, SocketId::ANY)?;
         let port = Builder::for_device("test0", "net_ring0")?
             .set_rx_lcores(rx_lcores.clone())?
             .set_tx_lcores(tx_lcores.clone())?
