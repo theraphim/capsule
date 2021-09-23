@@ -397,6 +397,10 @@ pub enum PortError {
     /// The pipeline for the port is already set.
     #[error("pipeline already set.")]
     PipelineSet,
+
+    /// Symmetric RSS cannot be disabled
+    #[error("symmetric RSS cannot be disabled")]
+    SymRSSNoDisable,
 }
 
 /// Port builder.
@@ -409,6 +413,7 @@ pub(crate) struct Builder {
     tx_lcores: Vec<usize>,
     rxqs: usize,
     txqs: usize,
+    symmetric_rss: bool
 }
 
 impl Builder {
@@ -443,6 +448,7 @@ impl Builder {
             tx_lcores: vec![],
             rxqs: port_info.rx_desc_lim.nb_min as usize,
             txqs: port_info.tx_desc_lim.nb_min as usize,
+            symmetric_rss: false
         })
     }
 
@@ -569,12 +575,12 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns `DpdkError` if the device does not support symmetric RSS
+    /// Returns `PortError` if RX has not been enabled yet or an attempt is made to disable the feature
     pub(crate) fn set_symmetric_rss(&mut self, enable: bool) -> Result<&mut Self> {
         ensure!(self.rx_lcores.len() != 0, PortError::RxNotEnabled);
-        ensure!(enable, anyhow!("disabling symmetric RSS is not supported"));
+        ensure!(enable, PortError::SymRSSNoDisable);
         if self.rx_lcores.len() > 1 {
-            dpdk::eth_sym_rss_enable(self.port_id, self.rx_lcores.len())?;
+            self.symmetric_rss = true;
         }
         Ok(self)
     }
@@ -623,6 +629,11 @@ impl Builder {
         // configures the tx queues.
         for index in 0..self.tx_lcores.len() {
             dpdk::eth_tx_queue_setup(self.port_id, index.into(), self.txqs, socket, None)?;
+        }
+
+        // configures symmetric RSS (this has to be done after configuring the port so the max queue size is known)
+        if self.symmetric_rss {
+            dpdk::eth_sym_rss_enable(self.port_id, self.rx_lcores.len())?;
         }
 
         Ok(Port {
@@ -713,19 +724,6 @@ mod tests {
     }
 
     #[capsule::test]
-    fn set_symmetric_rss() -> Result<()> {
-        let rx_lcores = (0..2).collect::<Vec<_>>();
-        let mut builder = Builder::for_device("test0", "net_tap0")?;
-
-        assert!(builder.set_symmetric_rss(true).is_err());
-        builder.set_rx_lcores(rx_lcores.clone())?;
-        assert!(builder.set_symmetric_rss(true).is_ok());
-        assert!(builder.set_symmetric_rss(false).is_err());
-
-        Ok(())
-    }
-
-    #[capsule::test]
     fn build_port() -> Result<()> {
         let rx_lcores = (0..2).collect::<Vec<_>>();
         let tx_lcores = (3..6).collect::<Vec<_>>();
@@ -741,6 +739,19 @@ mod tests {
         assert_eq!(rx_lcores, port.rx_lcores);
         assert_eq!(tx_lcores, port.tx_lcores);
 
+        Ok(())
+    }
+
+    #[capsule::test]
+    fn symmetric_rss() -> Result<()> {
+        let rx_lcores = (0..2).collect::<Vec<_>>();
+        let tx_lcores = (3..6).collect::<Vec<_>>();
+        let mut pool = Mempool::new("mp_build_port", 15, 0, SocketId::ANY)?;
+        let port = Builder::for_device("test0", "net_ring0")?
+            .set_rx_lcores(rx_lcores.clone())?
+            .set_tx_lcores(tx_lcores.clone())?
+            .set_symmetric_rss(true)?
+            .build(&mut pool)?;
         Ok(())
     }
 
