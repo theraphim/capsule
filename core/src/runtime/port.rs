@@ -578,6 +578,9 @@ impl Builder {
         ensure!(enable, PortError::SymRSSNoDisable);
         if self.rx_lcores.len() > 1 {
             self.symmetric_rss = true;
+            debug!(port = ?self.name, "symmetric RSS enabled.");
+        } else {
+            debug!(port = ?self.name, "RSS not enabled, ignoring request to enable symmetric RSS.");
         }
         Ok(self)
     }

@@ -29,6 +29,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use thiserror::Error;
 use std::mem::MaybeUninit;
+use tracing::trace;
 
 /// Initializes the Environment Abstraction Layer (EAL).
 pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<()> {
@@ -353,6 +354,7 @@ pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
 
 /// Creates a symmetric RSS flow rule for a device with a specific protocol match and RSS type
 fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<cffi::rte_flow_item_type::Type>, num_queues: usize) -> Result<&'static cffi::rte_flow> {
+    trace!("Creating symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}", port_id, rss_hf, proto_stack);
     // Create pattern items
     let mut flow_items: Vec<cffi::rte_flow_item> = Vec::new();
     for proto in &proto_stack {
@@ -403,7 +405,10 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
                                                           flow_items.as_ptr(),
                                                           flow_actions.as_ptr(),
                                                           flow_error_uninit.as_mut_ptr()).as_ref() } {
-        Some(flow_rule) => Ok(flow_rule),
+        Some(flow_rule) => {
+            trace!("Created symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}", port_id, rss_hf, proto_stack);
+            Ok(flow_rule)
+        },
         None => {
             let rte_error = DpdkError::new();
             let flow_error = unsafe { flow_error_uninit.assume_init() };
