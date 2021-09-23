@@ -352,7 +352,7 @@ pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
 }
 
 /// Enables symmetric RSS for a device
-pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<()> {
+pub(crate) fn eth_sym_rss_enable(port_id: PortId, rss_hf: u64, num_queues: usize) -> Result<()> {
     // Create pattern items
     let flow_item_end = cffi::rte_flow_item {
         type_: cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_END,
@@ -365,7 +365,7 @@ pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<(
     let flow_action_rss_conf = cffi::rte_flow_action_rss {
         func: cffi::rte_eth_hash_function::RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ,
         level: 0,
-        types: 0,
+        types: rss_hf,
         key_len: 0,
         queue_num: num_queues as u32,
         key: ptr::null(),

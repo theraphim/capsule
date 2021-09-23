@@ -452,6 +452,10 @@ impl Builder {
         })
     }
 
+    const RSS_HF: u64 =
+        (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
+            as u64;
+
     /// Sets the lcores to receive packets on.
     ///
     /// Enables receive side scaling if more than one lcore is used for RX or
@@ -468,16 +472,10 @@ impl Builder {
         );
 
         if lcores.len() > 1 {
-            const RSS_HF: u64 =
-                (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
-                    as u64;
-
             // enables receive side scaling.
             self.port_conf.rxmode.mq_mode = cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS;
             self.port_conf.rx_adv_conf.rss_conf.rss_hf =
-                self.port_info.flow_type_rss_offloads & RSS_HF;
-
-
+                self.port_info.flow_type_rss_offloads & Self::RSS_HF;
 
             debug!(
                 port = ?self.name,
@@ -633,7 +631,9 @@ impl Builder {
 
         // configures symmetric RSS (this has to be done after configuring the port so the max queue size is known)
         if self.symmetric_rss {
-            dpdk::eth_sym_rss_enable(self.port_id, self.rx_lcores.len())?;
+            dpdk::eth_sym_rss_enable(self.port_id,
+                                     self.port_info.flow_type_rss_offloads & Self::RSS_HF,
+                                     self.rx_lcores.len())?;
         }
 
         Ok(Port {
