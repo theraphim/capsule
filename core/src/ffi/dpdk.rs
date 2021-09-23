@@ -19,7 +19,7 @@
 use super::{AsStr, EasyPtr, ToCString, ToResult};
 use crate::net::MacAddr;
 use crate::{debug, error};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use capsule_ffi as cffi;
 use std::fmt;
 use std::mem;
@@ -28,6 +28,7 @@ use std::os::raw;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use thiserror::Error;
+use std::mem::MaybeUninit;
 
 /// Initializes the Environment Abstraction Layer (EAL).
 pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<()> {
@@ -348,6 +349,61 @@ pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
             .into_result(DpdkError::from_errno)
             .map(|_| ())
     }
+}
+
+/// Enables symmetric RSS for a device
+pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<()> {
+    // Create pattern items
+    let flow_item_end = cffi::rte_flow_item {
+        type_: cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_END,
+        spec: ptr::null(),
+        last: ptr::null(),
+        mask: ptr::null()
+    };
+    // Create config for RSS action type
+    let queue_idx = (0..num_queues).map(|idx| idx as u16).collect::<Vec<_>>();
+    let flow_action_rss_conf = cffi::rte_flow_action_rss {
+        func: cffi::rte_eth_hash_function::RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ,
+        level: 0,
+        types: 0,
+        key_len: 0,
+        queue_num: num_queues as u32,
+        key: ptr::null(),
+        queue: queue_idx.as_ptr()
+    };
+    // Creation action items
+    let flow_action_rss_conf_ptr: *const cffi::rte_flow_action_rss = &flow_action_rss_conf;
+    let flow_action_rss = cffi::rte_flow_action {
+        type_: cffi::rte_flow_action_type::RTE_FLOW_ACTION_TYPE_RSS,
+        conf: flow_action_rss_conf_ptr as *const raw::c_void
+    };
+    let flow_action_end = cffi::rte_flow_action {
+        type_: cffi::rte_flow_action_type::RTE_FLOW_ACTION_TYPE_END,
+        conf: ptr::null()
+    };
+    let flow_items = [flow_item_end];
+    let flow_actions = [flow_action_rss, flow_action_end];
+    let flow_attr = cffi::rte_flow_attr {
+        group: 0,
+        priority: 0,
+        _bitfield_align_1: [],
+        _bitfield_1: cffi::rte_flow_attr::new_bitfield_1(1, 0, 0, 0)
+    };
+    let mut flow_error_uninit = MaybeUninit::<cffi::rte_flow_error>::uninit();
+    let _flow_rule = match unsafe { cffi::rte_flow_create(port_id.0,
+                                                             &flow_attr,
+                                                             flow_items.as_ptr(),
+                                                             flow_actions.as_ptr(),
+                                                             flow_error_uninit.as_mut_ptr()).as_ref() } {
+        Some(flow_rule) => flow_rule,
+        None => {
+            let rte_error = DpdkError::new();
+            let flow_error = unsafe { flow_error_uninit.assume_init() };
+            return Err(anyhow!("Symmetric RSS flow rule create failed: {}, detail: {} ({})", rte_error, flow_error.message.as_str(), flow_error.type_))
+        }
+    };
+
+    Ok(())
 }
 
 /// Configures a device.

@@ -21,7 +21,7 @@ use crate::ffi::dpdk::{self, LcoreId, MbufPtr, PortId, PortRxQueueId, PortTxQueu
 use crate::net::MacAddr;
 use crate::packets::{Mbuf, Packet, Postmark};
 use crate::{debug, ensure, info, warn};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_channel::{self, Receiver, Sender};
 use capsule_ffi as cffi;
 use futures_lite::future;
@@ -455,7 +455,7 @@ impl Builder {
     ///
     /// Returns `PortError` if the maximum number of RX queues is less than
     /// the number of lcores assigned.
-    pub(crate) fn set_rx_lcores(&mut self, lcores: Vec<usize>, symmetric_rss: bool) -> Result<&mut Self> {
+    pub(crate) fn set_rx_lcores(&mut self, lcores: Vec<usize>) -> Result<&mut Self> {
         ensure!(
             self.port_info.max_rx_queues >= lcores.len() as u16,
             PortError::InsufficientRxQueues(self.port_info.max_rx_queues)
@@ -471,15 +471,7 @@ impl Builder {
             self.port_conf.rx_adv_conf.rss_conf.rss_hf =
                 self.port_info.flow_type_rss_offloads & RSS_HF;
 
-            // makes RSS symmetric if requested
-            // ref:
-            // http://galsagie.github.io/2015/02/26/dpdk-tips-1/
-            // https://www.ran-lifshitz.com/2014/08/28/symmetric-rss-receive-side-scaling/
-            if symmetric_rss {
-                let mut symmetric_rss_key: [u8; 40] = [0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A];
-                self.port_conf.rx_adv_conf.rss_conf.rss_key = symmetric_rss_key.as_mut_ptr();
-                self.port_conf.rx_adv_conf.rss_conf.rss_key_len = symmetric_rss_key.len() as u8;
-            }
+
 
             debug!(
                 port = ?self.name,
@@ -573,6 +565,20 @@ impl Builder {
         Ok(self)
     }
 
+    /// Sets symmetric receive side scaling mode for the port if RSS is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DpdkError` if the device does not support symmetric RSS
+    pub(crate) fn set_symmetric_rss(&mut self, enable: bool) -> Result<&mut Self> {
+        ensure!(self.rx_lcores.len() != 0, PortError::RxNotEnabled);
+        ensure!(enable, anyhow!("disabling symmetric RSS is not supported"));
+        if self.rx_lcores.len() > 1 {
+            dpdk::eth_sym_rss_enable(self.port_id, self.rx_lcores.len())?;
+        }
+        Ok(self)
+    }
+
     /// Builds the port.
     ///
     /// # Errors
@@ -646,10 +652,10 @@ mod tests {
 
         // ring port has a max rxq of 16.
         let lcores = (0..17).collect::<Vec<_>>();
-        assert!(builder.set_rx_lcores(lcores, false).is_err());
+        assert!(builder.set_rx_lcores(lcores).is_err());
 
         let lcores = (0..16).collect::<Vec<_>>();
-        assert!(builder.set_rx_lcores(lcores.clone(), false).is_ok());
+        assert!(builder.set_rx_lcores(lcores.clone()).is_ok());
         assert_eq!(lcores, builder.rx_lcores);
         assert_eq!(
             cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS,
@@ -707,12 +713,25 @@ mod tests {
     }
 
     #[capsule::test]
+    fn set_symmetric_rss() -> Result<()> {
+        let rx_lcores = (0..2).collect::<Vec<_>>();
+        let mut builder = Builder::for_device("test0", "net_tap0")?;
+
+        assert!(builder.set_symmetric_rss(true).is_err());
+        builder.set_rx_lcores(rx_lcores.clone())?;
+        assert!(builder.set_symmetric_rss(true).is_ok());
+        assert!(builder.set_symmetric_rss(false).is_err());
+
+        Ok(())
+    }
+
+    #[capsule::test]
     fn build_port() -> Result<()> {
         let rx_lcores = (0..2).collect::<Vec<_>>();
         let tx_lcores = (3..6).collect::<Vec<_>>();
         let mut pool = Mempool::new("mp_build_port", 15, 0, SocketId::ANY)?;
         let port = Builder::for_device("test0", "net_ring0")?
-            .set_rx_lcores(rx_lcores.clone(), true)?
+            .set_rx_lcores(rx_lcores.clone())?
             .set_tx_lcores(tx_lcores.clone())?
             .build(&mut pool)?;
 
@@ -729,7 +748,7 @@ mod tests {
     fn port_rx_tx() -> Result<()> {
         let mut pool = Mempool::new("mp_port_rx", 15, 0, SocketId::ANY)?;
         let port = Builder::for_device("test0", "net_null0")?
-            .set_rx_lcores(vec![0], false)?
+            .set_rx_lcores(vec![0])?
             .set_tx_lcores(vec![0])?
             .build(&mut pool)?;
 
