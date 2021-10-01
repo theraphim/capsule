@@ -26,7 +26,7 @@ use capsule::packets::ip::v6::{Ipv6, Ipv6Packet};
 use capsule::packets::ip::ProtocolNumbers;
 use capsule::packets::tcp::{Tcp4, Tcp6};
 use capsule::packets::{Mbuf, Packet, Postmark};
-use capsule::runtime::{self, Outbox, Runtime};
+use capsule::runtime::{self, Runtime};
 use colored::Colorize;
 use once_cell::sync::Lazy;
 use signal_hook::consts;
@@ -66,7 +66,7 @@ fn get_v4_port(mac: MacAddr, ip: Ipv6Addr, port: u16) -> u16 {
     }
 }
 
-fn nat_6to4(packet: Mbuf, cap1: &Outbox) -> Result<Postmark> {
+fn nat_6to4(packet: Mbuf) -> Result<Postmark> {
     const SRC_IP: Ipv4Addr = Ipv4Addr::new(10, 100, 1, 11);
     const DST_MAC: MacAddr = MacAddr::new(0x02, 0x00, 0x00, 0xff, 0xff, 0xff);
 
@@ -104,10 +104,9 @@ fn nat_6to4(packet: Mbuf, cap1: &Outbox) -> Result<Postmark> {
         let fmt = format!("{:?}", tcp).bright_blue();
         info!("{}", fmt);
 
-        let _ = cap1.push(tcp);
-        Ok(Postmark::Emit)
+        Ok(Postmark::emit(tcp))
     } else {
-        Ok(Postmark::Drop(v6.reset()))
+        Ok(Postmark::drop(v6))
     }
 }
 
@@ -136,7 +135,7 @@ fn get_v6_dst(port: u16) -> Option<(MacAddr, Ipv6Addr, u16)> {
         .and_then(|(ip, port)| MACS.lock().unwrap().get(ip).map(|mac| (*mac, *ip, *port)))
 }
 
-fn nat_4to6(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
+fn nat_4to6(packet: Mbuf) -> Result<Postmark> {
     let ethernet = e!(packet.parse::<Ethernet>());
     let v4 = e!(ethernet.parse::<Ipv4>());
 
@@ -171,13 +170,12 @@ fn nat_4to6(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
             let fmt = format!("{:?}", tcp).bright_blue();
             info!("{}", fmt);
 
-            let _ = cap0.push(tcp);
-            Ok(Postmark::Emit)
+            Ok(Postmark::emit(tcp))
         } else {
-            Ok(Postmark::Drop(v4.reset()))
+            Ok(Postmark::drop(v4))
         }
     } else {
-        Ok(Postmark::Drop(v4.reset()))
+        Ok(Postmark::drop(v4))
     }
 }
 
@@ -190,11 +188,8 @@ fn main() -> Result<()> {
     let config = runtime::load_config()?;
     let runtime = Runtime::from_config(config)?;
 
-    let cap1 = runtime.ports().get("cap1")?.outbox()?;
-    runtime.set_port_pipeline("cap0", move |packet| nat_6to4(packet, &cap1))?;
-
-    let cap0 = runtime.ports().get("cap0")?.outbox()?;
-    runtime.set_port_pipeline("cap1", move |packet| nat_4to6(packet, &cap0))?;
+    runtime.spawn_rx_tx_pipeline("cap0", nat_6to4, Some("cap1"))?;
+    runtime.spawn_rx_tx_pipeline("cap1", nat_4to6, Some("cap0"))?;
 
     let _guard = runtime.execute()?;
 

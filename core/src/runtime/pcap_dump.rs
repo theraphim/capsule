@@ -117,7 +117,7 @@ pub(crate) fn enable_pcap_dump(
     let mut pcap_dump = PcapDump::new(data_dir)?;
 
     for port in ports.iter() {
-        for (index, lcore_id) in port.rx_lcores().iter().enumerate() {
+        for (index, lcore_id) in port.lcores().iter().enumerate() {
             let lcore = lcores.get(*lcore_id)?;
             let filename = format!("{}-rx-{:?}.pcap", port.name(), lcore.id());
             let capture = pcap_dump.new_capture(&filename)?;
@@ -130,7 +130,7 @@ pub(crate) fn enable_pcap_dump(
             capture.set_guard(guard);
         }
 
-        for (index, lcore_id) in port.tx_lcores().iter().enumerate() {
+        for (index, lcore_id) in port.lcores().iter().enumerate() {
             let lcore = lcores.get(*lcore_id)?;
             let filename = format!("{}-tx-{:?}.pcap", port.name(), lcore.id());
             let capture = pcap_dump.new_capture(&filename)?;

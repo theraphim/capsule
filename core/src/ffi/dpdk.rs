@@ -30,6 +30,9 @@ use std::ptr;
 use thiserror::Error;
 use std::mem::MaybeUninit;
 use tracing::trace;
+use std::convert::{TryFrom, TryInto};
+use capsule_ffi::rte_lcore_state_t::Type;
+use std::os::raw::c_uint;
 
 /// Initializes the Environment Abstraction Layer (EAL).
 pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<()> {
@@ -148,6 +151,18 @@ pub(crate) fn mempool_free(mp: &mut MempoolPtr) {
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 pub(crate) struct LcoreId(raw::c_uint);
 
+impl Into<raw::c_uint> for LcoreId {
+    fn into(self) -> c_uint {
+        self.0
+    }
+}
+
+impl From<raw::c_uint> for LcoreId {
+    fn from(id: c_uint) -> Self {
+        LcoreId(id)
+    }
+}
+
 impl LcoreId {
     /// Any lcore to indicate that no thread affinity is set.
     #[cfg(test)]
@@ -207,24 +222,32 @@ pub(crate) fn get_next_lcore(
 /// The function passed to `rte_eal_remote_launch`.
 unsafe extern "C" fn lcore_fn<F>(arg: *mut raw::c_void) -> raw::c_int
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> Result<Option<i32>> + Send + 'static,
 {
     let f = Box::from_raw(arg as *mut F);
 
     // in case the closure panics, let's not crash the app.
-    let result = panic::catch_unwind(AssertUnwindSafe(f));
+    let res = panic::catch_unwind(AssertUnwindSafe(f));
+    let result = match res {
+        Ok(Ok(opt)) => Ok(opt.map(|val| val.into())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow!("Panicked")),
+    };
 
-    if let Err(err) = result {
-        error!(lcore = ?LcoreId::current(), error = ?err, "failed to execute closure.");
+    return match result {
+        Err(err) => {
+            error!(lcore = ?LcoreId::current(), error = ?err, "failed to execute closure.");
+            -1
+        },
+        Ok(None) => 0,
+        Ok(Some(val)) => val
     }
-
-    0
 }
 
 /// Launches a function on another lcore.
 pub(crate) fn eal_remote_launch<F>(worker_id: LcoreId, f: F) -> Result<()>
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> Result<Option<i32>> + Send + 'static,
 {
     let ptr = Box::into_raw(Box::new(f)) as *mut raw::c_void;
 
@@ -235,8 +258,44 @@ where
     }
 }
 
+pub(crate) enum LcoreState {
+    WAIT,
+    RUNNING,
+    FINISHED,
+}
+
+impl TryFrom<cffi::rte_lcore_state_t::Type> for LcoreState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Type) -> std::result::Result<Self, Self::Error> {
+        match value {
+            cffi::rte_lcore_state_t::WAIT => Ok(LcoreState::WAIT),
+            cffi::rte_lcore_state_t::RUNNING => Ok(LcoreState::RUNNING),
+            cffi::rte_lcore_state_t::FINISHED => Ok(LcoreState::FINISHED),
+            _ => {
+                Err(anyhow!("Not a valid LCoreState"))
+            }
+        }
+    }
+}
+
+/// Get the state of the lcore identified by worker_id.
+pub(crate) fn eal_get_lcore_state(worker_id: LcoreId) -> Result<LcoreState> {
+    unsafe { cffi::rte_eal_get_lcore_state(worker_id.0) }.try_into()
+}
+
+/// Wait until an lcore finishes its job.
+/// Ignores the return value.
+pub(crate) fn eal_wait_lcore(worker_id: LcoreId) -> Result<Option<i32>> {
+    match unsafe { cffi::rte_eal_wait_lcore(worker_id.0) }.into() {
+        -1 => Err(anyhow!("LCore function returned an error")),
+        0 => Ok(None),
+        val => Ok(Some(val))
+    }
+}
+
 /// An opaque identifier for a PMD device port.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub(crate) struct PortId(u16);
 
 impl PortId {
@@ -470,24 +529,30 @@ pub(crate) fn eth_dev_configure(
 
 /// An opaque identifier for a port's receive queue.
 #[derive(Copy, Clone)]
-pub(crate) struct PortRxQueueId(u16);
+pub(crate) struct PortQueueId(u16);
 
-impl fmt::Debug for PortRxQueueId {
+impl fmt::Debug for PortQueueId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "rxq{}", self.0)
+        write!(f, "q{}", self.0)
     }
 }
 
-impl From<usize> for PortRxQueueId {
+impl From<usize> for PortQueueId {
     fn from(id: usize) -> Self {
-        PortRxQueueId(id as u16)
+        PortQueueId(id as u16)
+    }
+}
+
+impl Into<usize> for PortQueueId {
+    fn into(self) -> usize {
+        self.0.into()
     }
 }
 
 /// Allocates and sets up a receive queue for a device.
 pub(crate) fn eth_rx_queue_setup(
     port_id: PortId,
-    rx_queue_id: PortRxQueueId,
+    queue_id: PortQueueId,
     nb_rx_desc: usize,
     socket_id: SocketId,
     rx_conf: Option<&cffi::rte_eth_rxconf>,
@@ -496,7 +561,7 @@ pub(crate) fn eth_rx_queue_setup(
     unsafe {
         cffi::rte_eth_rx_queue_setup(
             port_id.0,
-            rx_queue_id.0,
+            queue_id.0,
             nb_rx_desc as u16,
             socket_id.0 as raw::c_uint,
             rx_conf.map_or(ptr::null(), |conf| conf),
@@ -510,8 +575,8 @@ pub(crate) fn eth_rx_queue_setup(
 /// Removes an RX or TX packet callback from a given port and queue.
 #[allow(dead_code)]
 pub(crate) enum RxTxCallbackGuard {
-    Rx(PortId, PortRxQueueId, *const cffi::rte_eth_rxtx_callback),
-    Tx(PortId, PortTxQueueId, *const cffi::rte_eth_rxtx_callback),
+    Rx(PortId, PortQueueId, *const cffi::rte_eth_rxtx_callback),
+    Tx(PortId, PortQueueId, *const cffi::rte_eth_rxtx_callback),
 }
 
 impl Drop for RxTxCallbackGuard {
@@ -541,7 +606,7 @@ impl Drop for RxTxCallbackGuard {
 #[allow(dead_code)]
 pub(crate) fn eth_add_rx_callback<T>(
     port_id: PortId,
-    queue_id: PortRxQueueId,
+    queue_id: PortQueueId,
     callback: cffi::rte_rx_callback_fn,
     user_param: &mut T,
 ) -> Result<RxTxCallbackGuard> {
@@ -559,7 +624,7 @@ pub(crate) fn eth_add_rx_callback<T>(
 }
 
 /// Retrieves a burst of input packets from a receive queue of a device.
-pub(crate) fn eth_rx_burst(port_id: PortId, queue_id: PortRxQueueId, rx_pkts: &mut Vec<MbufPtr>) {
+pub(crate) fn eth_rx_burst(port_id: PortId, queue_id: PortQueueId, rx_pkts: &mut Vec<MbufPtr>) {
     let nb_pkts = rx_pkts.capacity();
 
     unsafe {
@@ -574,26 +639,10 @@ pub(crate) fn eth_rx_burst(port_id: PortId, queue_id: PortRxQueueId, rx_pkts: &m
     }
 }
 
-/// An opaque identifier for a port's transmit queue.
-#[derive(Copy, Clone)]
-pub(crate) struct PortTxQueueId(u16);
-
-impl fmt::Debug for PortTxQueueId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "txq{}", self.0)
-    }
-}
-
-impl From<usize> for PortTxQueueId {
-    fn from(id: usize) -> Self {
-        PortTxQueueId(id as u16)
-    }
-}
-
 /// Allocates and sets up a transmit queue for a device.
 pub(crate) fn eth_tx_queue_setup(
     port_id: PortId,
-    tx_queue_id: PortTxQueueId,
+    queue_id: PortQueueId,
     nb_tx_desc: usize,
     socket_id: SocketId,
     tx_conf: Option<&cffi::rte_eth_txconf>,
@@ -601,7 +650,7 @@ pub(crate) fn eth_tx_queue_setup(
     unsafe {
         cffi::rte_eth_tx_queue_setup(
             port_id.0,
-            tx_queue_id.0,
+            queue_id.0,
             nb_tx_desc as u16,
             socket_id.0 as raw::c_uint,
             tx_conf.map_or(ptr::null(), |conf| conf),
@@ -615,7 +664,7 @@ pub(crate) fn eth_tx_queue_setup(
 #[allow(dead_code)]
 pub(crate) fn eth_add_tx_callback<T>(
     port_id: PortId,
-    queue_id: PortTxQueueId,
+    queue_id: PortQueueId,
     callback: cffi::rte_tx_callback_fn,
     user_param: &mut T,
 ) -> Result<RxTxCallbackGuard> {
@@ -635,7 +684,7 @@ pub(crate) fn eth_add_tx_callback<T>(
 /// Sends a burst of output packets on a transmit queue of a device.
 pub(crate) fn eth_tx_burst(
     port_id: PortId,
-    queue_id: PortTxQueueId,
+    queue_id: PortQueueId,
     tx_pkts: &mut Vec<MbufPtr>,
 ) -> usize {
     let nb_pkts = tx_pkts.len();

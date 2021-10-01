@@ -31,58 +31,14 @@ pub(crate) use self::lcore::*;
 pub use self::lcore::{Lcore, LcoreMap, LcoreNotFound};
 pub use self::mempool::Mempool;
 pub(crate) use self::mempool::*;
-pub use self::port::{Outbox, Port, PortError, PortMap};
+pub use self::port::{Port, PortError, PortMap};
 
 use crate::ffi::dpdk::{self, LcoreId};
 use crate::packets::{Mbuf, Postmark};
 use crate::{debug, info};
 use anyhow::Result;
-use async_channel::{self, Receiver, Sender};
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::ops::DerefMut;
-
-/// Trigger for the shutdown.
-pub(crate) struct ShutdownTrigger(Sender<()>, Receiver<()>);
-
-impl ShutdownTrigger {
-    /// Creates a new shutdown trigger.
-    ///
-    /// Leverages the behavior of an async channel. When the sender is dropped
-    /// from scope, it closes the channel and causes the receiver side future
-    /// in the executor queue to resolve.
-    pub(crate) fn new() -> Self {
-        let (s, r) = async_channel::unbounded();
-        Self(s, r)
-    }
-
-    /// Returns a wait handle.
-    pub(crate) fn get_wait(&self) -> ShutdownWait {
-        ShutdownWait(self.1.clone())
-    }
-
-    /// Returns whether the trigger is being waited on.
-    pub(crate) fn is_waited(&self) -> bool {
-        // a receiver count greater than 1 indicating that there are receiver
-        // clones in scope, hence the trigger is being waited on.
-        self.0.receiver_count() > 1
-    }
-
-    /// Triggers the shutdown.
-    pub(crate) fn fire(self) {
-        drop(self.0)
-    }
-}
-
-/// Shutdown wait handle.
-pub(crate) struct ShutdownWait(Receiver<()>);
-
-impl ShutdownWait {
-    /// A future that waits till the shutdown trigger is fired.
-    pub(crate) async fn wait(&self) {
-        self.0.recv().await.unwrap_or(())
-    }
-}
 
 /// The Capsule runtime.
 ///
@@ -136,27 +92,22 @@ impl Runtime {
         let lcores = self::lcore_pool();
 
         for lcore in lcores.iter() {
-            let mut ptr = mempool.ptr_mut().clone();
-            lcore.block_on(async move { MEMPOOL.with(|tls| tls.set(ptr.deref_mut())) });
+            let ptr = mempool.ptr_mut().clone();
+            lcore.add_mempool(ptr)?;
         }
 
         info!("initializing ports ...");
         let mut ports = Vec::new();
         for port in config.ports.iter() {
-            let mut port = port::Builder::for_device(&port.name, &port.device)?
+            let port = port::Builder::for_device(&port.name, &port.device)?
                 .set_rxqs_txqs(port.rxqs, port.txqs)?
                 .set_promiscuous(port.promiscuous)?
                 .set_multicast(port.multicast)?
-                .set_rx_lcores(port.rx_cores.clone())?
-                .set_tx_lcores(port.tx_cores.clone())?
+                .set_lcores(port.lcores.clone())?
                 .set_symmetric_rss(config.symmetric_rss.unwrap_or(false))?
                 .build(&mut mempool)?;
 
             debug!(?port);
-
-            if !port.tx_lcores().is_empty() {
-                port.spawn_tx_loops(&lcores)?;
-            }
 
             port.start()?;
             ports.push(port);
@@ -177,34 +128,40 @@ impl Runtime {
         })
     }
 
-    /// Sets the packet processing pipeline for port
-    pub fn set_port_pipeline<PipelineFn>(
+    /// Spawns an infinite RX->TX pipeline with the given function, thread locals and optionally a different port
+    /// for TX
+    pub fn spawn_rx_tx_pipeline_with_thread_locals<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
         &self,
-        port: &str,
-        pipeline_fn: PipelineFn
+        rx_port: &str,
+        pipeline_fn: PipelineFn,
+        thread_local_creator_fn: ThreadLocalCreatorFn,
+        tx_port: Option<&str>
     ) -> Result<()>
         where
-            PipelineFn: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static
+            PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+            ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+            ThreadLocal: Send + 'static
     {
-        let thread_local_creator_fn = || { () };
-        self.set_port_pipeline_with_thread_locals(port, move |packet, _: &mut ()| { pipeline_fn(packet) }, thread_local_creator_fn)
+        let rx_port_ = self.ports.get(rx_port)?;
+        let tx_port_ = match tx_port {
+            Some(port_name) => Some(self.ports().get(port_name)?),
+            None => None
+        };
+        rx_port_.spawn_rx_tx_pipeline(self.lcores(), pipeline_fn, thread_local_creator_fn, tx_port_)
     }
 
-    /// Sets the packet processing pipeline for port, optionally taking a function to create thread locals passed to the pipeline
-    pub fn set_port_pipeline_with_thread_locals<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+    /// Spawns an infinite RX->TX pipeline with the given function and optionally a different port
+    /// for TX
+    pub fn spawn_rx_tx_pipeline<PipelineFn>(
         &self,
-        port: &str,
+        rx_port: &str,
         pipeline_fn: PipelineFn,
-        thread_local_creator_fn: ThreadLocalCreatorFn
+        tx_port: Option<&str>
     ) -> Result<()>
-    where
-        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
-        ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
-        ThreadLocal: Send + 'static,
+        where
+            PipelineFn: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static,
     {
-        let port = self.ports.get(port)?;
-        port.spawn_rx_loops(pipeline_fn, thread_local_creator_fn, &self.lcores)?;
-        Ok(())
+       self.spawn_rx_tx_pipeline_with_thread_locals(rx_port, move |mbuf, _| pipeline_fn(mbuf), || (), tx_port)
     }
 
     /// Starts the runtime execution.

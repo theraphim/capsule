@@ -45,7 +45,7 @@ fn dump_pkt(packet: Mbuf) -> Result<Postmark> {
         _ => Err(anyhow!("not v4 or v6.")),
     }?;
 
-    Ok(Postmark::Drop(ethernet.reset()))
+    Ok(Postmark::drop(ethernet))
 }
 
 fn dump_v4(ethernet: &Ethernet) -> Result<()> {
@@ -86,8 +86,8 @@ fn main() -> Result<()> {
 
     let config = runtime::load_config()?;
     let runtime = Runtime::from_config(config)?;
-    runtime.set_port_pipeline("cap0", dump_pkt)?;
-    runtime.set_port_pipeline("cap1", dump_pkt)?;
+    runtime.spawn_rx_tx_pipeline("cap0", dump_pkt, None)?;
+    runtime.spawn_rx_tx_pipeline("cap1", dump_pkt, None)?;
     let _guard = runtime.execute()?;
 
     let term = Arc::new(AtomicBool::new(false));

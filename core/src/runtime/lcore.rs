@@ -16,49 +16,75 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use super::ShutdownTrigger;
-use crate::ffi::dpdk::{self, LcoreId};
-use crate::{debug, info};
-use anyhow::Result;
-use async_executor::Executor;
-use futures_lite::future;
+use crate::ffi::dpdk::{self, LcoreId, LcoreState, MempoolPtr};
+use crate::{info};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
-use std::sync::Arc;
 use thiserror::Error;
+use triggered::{Listener, Trigger, trigger};
+use crate::runtime::MEMPOOL;
+use std::ops::DerefMut;
 
-/// An async executor abstraction on top of a DPDK logical core.
+/// An abstraction on top of a DPDK logical core.
 pub struct Lcore {
     id: LcoreId,
-    executor: Arc<Executor<'static>>,
-    shutdown: Option<ShutdownTrigger>,
+    shutdown: (Trigger, Listener)
 }
 
 impl Lcore {
-    /// Creates a new executor for the given lcore id.
+    /// Creates a new LCore instance to manage tasks on this lcore
     ///
     /// # Errors
     ///
-    /// Returns `DpdkError` if the executor fails to run on the given lcore.
+    /// Returns `Error` if the given lcore is not in the WAIT state
     fn new(id: LcoreId) -> Result<Self> {
-        debug!(?id, "starting lcore.");
-        let trigger = ShutdownTrigger::new();
-        let executor = Arc::new(Executor::new());
+        match dpdk::eal_get_lcore_state(id) {
+            Ok(LcoreState::WAIT) =>
+                Ok(Lcore {
+                    id,
+                    shutdown: trigger()
+                }),
+            Err(e) => Err(e),
+            _ => {
+                Err(anyhow!("LCore not ready"))
+            }
+        }
+    }
 
-        let handle = trigger.get_wait();
-        let executor2 = Arc::clone(&executor);
-        dpdk::eal_remote_launch(id, move || {
-            info!(?id, "lcore started.");
-            let _ = future::block_on(executor2.run(handle.wait()));
-            info!(?id, "lcore stopped.");
-        })?;
+    /// Checks if the LCore is ready to have tasks executed on it
+    pub fn is_ready(&self) -> Result<bool> {
+        Ok(
+            match dpdk::eal_get_lcore_state(self.id())? {
+                LcoreState::WAIT => true,
+                _ => false,
+            }
+        )
+    }
 
-        Ok(Lcore {
-            id,
-            executor,
-            shutdown: Some(trigger),
-        })
+    /// Checks if the LCore is currently running
+    pub fn is_running(&self) -> Result<bool> {
+        Ok(
+            !self.shutdown.1.is_triggered() &&
+            match dpdk::eal_get_lcore_state(self.id())? {
+                LcoreState::RUNNING => true,
+                _ => false,
+            }
+        )
+    }
+
+    /// Sets the thread local mempool for this lcore
+    pub(crate) fn add_mempool(&self, mut mempool: MempoolPtr) -> Result<()> {
+        if !self.is_ready()? {
+            return Err(anyhow!("Lcore not ready"));
+        }
+        dpdk::eal_remote_launch(self.id(),
+                                move || {
+                                    MEMPOOL.with(|tls| tls.set(mempool.deref_mut()));
+                                    Ok(None)
+                                })?;
+        dpdk::eal_wait_lcore(self.id())?;
+        Ok(())
     }
 
     /// Returns the lcore id.
@@ -66,18 +92,50 @@ impl Lcore {
         self.id
     }
 
-    /// Spawns an async task and waits for it to complete.
-    pub(crate) fn block_on<T: Send + 'static>(
-        &self,
-        future: impl Future<Output = T> + Send + 'static,
-    ) -> T {
-        let task = self.executor.spawn(future);
-        future::block_on(task)
+    /// Spawns a function to be looped on this lcore
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` if the lcore is not in the WAIT state
+    pub fn run_loop<F>(&self, looped_fn: F) -> Result<()> where F: Fn() -> () + Send + 'static {
+        if !self.is_ready()? {
+            return Err(anyhow!("Lcore not ready. Perhaps you forgot to `join` the last execution?"));
+        }
+        let listener = self.shutdown.1.clone();
+        let id = self.id().clone();
+        dpdk::eal_remote_launch(self.id(), move || {
+            info!(?id, "lcore function started.");
+            while !listener.is_triggered() {
+                looped_fn();
+            }
+            info!(?id, "lcore function stopped.");
+            Ok(None)
+        })
     }
 
-    /// Spawns a background async task.
-    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        self.executor.spawn(future).detach();
+    /// Spawns a function to be run once on this lcore
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` if the lcore is not in the WAIT state
+    pub fn run_single<F>(&self, run_fn: F) -> Result<()> where F: FnOnce(Listener) -> Result<Option<i32>> + Send + 'static {
+        if !self.is_ready()? {
+            return Err(anyhow!("Lcore not ready"));
+        }
+        let id = self.id().clone();
+        let listener = self.shutdown.1.clone();
+        dpdk::eal_remote_launch(self.id(), move || {
+            info!(?id, "lcore function started.");
+            let result = run_fn(listener);
+            info!(?id, "lcore function stopped.");
+            result
+        })
+    }
+
+    /// Shuts down the current task and returns the result
+    pub fn join(&mut self) -> Result<Option<i32>> {
+        self.shutdown.0.trigger();
+        dpdk::eal_wait_lcore(self.id())
     }
 }
 
@@ -89,10 +147,7 @@ impl fmt::Debug for Lcore {
 
 impl Drop for Lcore {
     fn drop(&mut self) {
-        if let Some(trigger) = self.shutdown.take() {
-            debug!(id = ?self.id, "stopping lcore.");
-            trigger.fire();
-        }
+        let _ = self.join();
     }
 }
 
@@ -144,13 +199,18 @@ pub(crate) fn lcore_pool() -> LcoreMap {
 mod tests {
     use super::*;
     use std::thread;
+    use std::convert::TryInto;
 
     #[capsule::test]
     fn get_current_lcore_id_from_eal() {
         let next_id = dpdk::get_next_lcore(None, true, false).expect("panic!");
-        let lcore = Lcore::new(next_id).expect("panic!");
-        let lcore_id = lcore.block_on(async { LcoreId::current() });
-
+        let mut lcore = Lcore::new(next_id).expect("panic!");
+        lcore.run_single(|_| {
+            let id: u32 = LcoreId::current().into();
+            Ok(Some(id.try_into()?))
+        }).unwrap();
+        let id: u32 = lcore.join().unwrap().ok_or(anyhow!("No result")).unwrap().try_into().unwrap();
+        let lcore_id: LcoreId = id.into();
         assert_eq!(next_id, lcore_id);
     }
 

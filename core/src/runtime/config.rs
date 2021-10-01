@@ -82,10 +82,6 @@ pub struct RuntimeConfig {
     /// will run on.
     pub main_core: usize,
 
-    /// Worker cores used for packet processing and general async task
-    /// execution.
-    pub worker_cores: Vec<usize>,
-
     /// Turn on symmetric RSS so that packets belonging to the same connection in both directions
     /// end up in the same queue
     pub symmetric_rss: Option<bool>,
@@ -116,17 +112,11 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     fn other_cores(&self) -> Vec<usize> {
         let mut cores = vec![];
-        cores.extend(&self.worker_cores);
-
         self.ports.iter().for_each(|port| {
-            if !port.rx_cores.is_empty() {
-                cores.extend(&port.rx_cores);
-            }
-            if !port.tx_cores.is_empty() {
-                cores.extend(&port.tx_cores);
+            if !port.lcores.is_empty() {
+                cores.extend(&port.lcores);
             }
         });
-
         cores.sort_unstable();
         cores.dedup();
         cores
@@ -227,7 +217,6 @@ impl fmt::Debug for RuntimeConfig {
                 self.app_group.as_ref().unwrap_or(&self.app_name),
             )
             .field("main_core", &self.main_core)
-            .field("worker_cores", &self.worker_cores)
             .field("mempool", &self.mempool)
             .field("ports", &self.ports);
         if let Some(dpdk_args) = &self.dpdk_args {
@@ -299,15 +288,9 @@ pub struct PortConfig {
     #[serde(default)]
     pub args: Option<String>,
 
-    /// The lcores to receive packets on. When no lcore specified, the port
-    /// will be TX only.
+    /// The lcores to receive and send packets on.
     #[serde(default)]
-    pub rx_cores: Vec<usize>,
-
-    /// The lcores to transmit packets on. When no lcore specified, the port
-    /// will be RX only.
-    #[serde(default)]
-    pub tx_cores: Vec<usize>,
+    pub lcores: Vec<usize>,
 
     /// The receive queue size. Defaults to `128`.
     #[serde(default = "default_port_rxqs")]
@@ -351,11 +334,8 @@ impl fmt::Debug for PortConfig {
         if let Some(args) = &self.args {
             d.field("args", args);
         }
-        if !self.rx_cores.is_empty() {
-            d.field("rx_cores", &self.rx_cores);
-        }
-        if !self.tx_cores.is_empty() {
-            d.field("tx_cores", &self.tx_cores);
+        if !self.lcores.is_empty() {
+            d.field("lcores", &self.lcores);
         }
         d.field("rxqs", &self.rxqs)
             .field("txqs", &self.txqs)
@@ -393,7 +373,6 @@ mod tests {
         const CONFIG: &str = r#"
             app_name = "myapp"
             main_core = 0
-            worker_cores = [1, 2]
             [[ports]]
                 name = "eth0"
                 device = "0000:00:01.0"
@@ -408,8 +387,7 @@ mod tests {
         assert_eq!(default_capacity(), config.mempool.capacity);
         assert_eq!(default_cache_size(), config.mempool.cache_size);
         assert_eq!(None, config.ports[0].args);
-        assert!(config.ports[0].rx_cores.is_empty());
-        assert!(config.ports[0].tx_cores.is_empty());
+        assert!(config.ports[0].lcores.is_empty());
         assert_eq!(default_port_rxqs(), config.ports[0].rxqs);
         assert_eq!(default_port_txqs(), config.ports[0].txqs);
         assert_eq!(default_promiscuous_mode(), config.ports[0].promiscuous);
@@ -427,7 +405,6 @@ mod tests {
             secondary = false
             app_group = "mygroup"
             main_core = 0
-            worker_cores = [1, 2]
             dpdk_args = "-v --log-level eal:8"
             [mempool]
                 capacity = 255
@@ -435,15 +412,14 @@ mod tests {
             [[ports]]
                 name = "eth0"
                 device = "0000:00:01.0"
-                rx_cores = [3]
-                tx_cores = [0]
+                lcores = [1, 2]
                 rxqs = 32
                 txqs = 32
             [[ports]]
                 name = "eth1"
                 device = "net_pcap0"
                 args = "rx=lo,tx=lo"
-                tx_cores = [4]
+                lcores = [3, 4]
                 rxqs = 32
                 txqs = 32
         "#;
@@ -462,9 +438,9 @@ mod tests {
                 "--vdev",
                 "net_pcap0,rx=lo,tx=lo",
                 "--main-lcore",
-                "127",
+                "0",
                 "--lcores",
-                "0,1,2,3,4,127@0",
+                "1,2,3,4,0@0",
                 "-v",
                 "--log-level",
                 "eal:8"

@@ -21,7 +21,7 @@ use capsule::packets::ethernet::Ethernet;
 use capsule::packets::icmp::v4::{EchoReply, EchoRequest};
 use capsule::packets::ip::v4::Ipv4;
 use capsule::packets::{Mbuf, Packet, Postmark};
-use capsule::runtime::{self, Outbox, Runtime};
+use capsule::runtime::{self, Runtime};
 use signal_hook::consts;
 use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn reply_echo(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
+fn reply_echo(packet: Mbuf) -> Result<Postmark> {
     let reply = Mbuf::new()?;
 
     let ethernet = packet.peek::<Ethernet>()?;
@@ -53,9 +53,7 @@ fn reply_echo(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
     info!(?request);
     info!(?reply);
 
-    let _ = cap0.push(reply);
-
-    Ok(Postmark::Drop(packet))
+    Ok(Postmark::emit_and_drop(reply, packet))
 }
 
 fn main() -> Result<()> {
@@ -67,8 +65,13 @@ fn main() -> Result<()> {
     let config = runtime::load_config()?;
     let runtime = Runtime::from_config(config)?;
 
-    let outbox = runtime.ports().get("cap0")?.outbox()?;
-    runtime.set_port_pipeline("cap0", move |packet| reply_echo(packet, &outbox))?;
+    runtime.ports()
+        .get("cap0")?
+        .spawn_rx_tx_pipeline(
+            runtime.lcores(),
+            |mbuf, _| reply_echo(mbuf),
+            || (),
+            None)?;
 
     let _guard = runtime.execute()?;
 

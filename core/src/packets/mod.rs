@@ -365,12 +365,47 @@ impl<T> Deref for Immutable<'_, T> {
 /// of packet processing. A packet can either be emitted through port TX,
 /// intentionally dropped, or aborted due to an error.
 #[derive(Debug)]
-pub enum Postmark {
-    /// Packet emitted through a port TX.
-    Emit,
-
+pub struct Postmark {
+    /// Packet(s) emitted through a port TX.
+    pub(crate) emit: Vec<Mbuf>,
     /// Packet intentionally dropped.
-    Drop(Mbuf),
+    pub(crate) drop: Option<Mbuf>,
+}
+
+impl Postmark {
+    /// Emit multiple packets
+    pub fn emit_multi(emit: Vec<Mbuf>) -> Postmark {
+        Postmark {
+            emit,
+            drop: None
+        }
+    }
+
+    /// Emit a single packet
+    pub fn emit<E: Packet>(emit: E) -> Postmark {
+        Self::emit_multi(vec![emit.reset()])
+    }
+
+    /// Drop a single packet
+    pub fn drop<D: Packet>(drop: D) -> Postmark {
+        Postmark {
+            emit: vec![],
+            drop: Some(drop.reset())
+        }
+    }
+
+    /// Emit multiple packets and drop a single packet at the same time
+    pub fn emit_multi_and_drop(emit: Vec<Mbuf>, drop: Mbuf) -> Postmark {
+        Postmark {
+            emit,
+            drop: Some(drop),
+        }
+    }
+
+    /// Emit a single packet and drop a single packet at the same time
+    pub fn emit_and_drop<E: Packet, D: Packet>(emit: E, drop: D) -> Postmark {
+        Self::emit_multi_and_drop(vec![emit.reset()], drop.reset())
+    }
 }
 
 #[cfg(test)]

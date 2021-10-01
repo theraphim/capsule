@@ -1,6 +1,5 @@
 app_name = "kni"
 main_core = 0
-worker_cores = []
 
 [mempool]
     capacity = 65535

@@ -21,13 +21,11 @@ doctest = false
 
 [dependencies]
 anyhow = "1.0"
-async-channel = "1.6"
-async-executor = "1.4"
+triggered = "0.1.2"
 capsule-ffi = { version = "0.2.0", path = "../ffi" }
 capsule-macros = { version = "0.2.0", path = "../macros" }
 clap = "2.33"
 criterion = { version = "0.3", optional = true }
-futures-lite = "1.11"
 libc = "0.2"
 metrics = "0.14"
 once_cell = "1.7"

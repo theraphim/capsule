@@ -45,11 +45,11 @@ macro_rules! ensure {
 macro_rules! error {
     (cond: $cond:expr, $($arg:tt)+) => (
         if $cond {
-            error!($($arg)+);
+            error!($($arg)+)
         }
     );
     ($($arg:tt)+) => (
-        ::tracing::error!($($arg)+);
+        ::tracing::error!($($arg)+)
     )
 }
 
@@ -58,11 +58,11 @@ macro_rules! error {
 macro_rules! warn {
     (cond: $cond:expr, $($arg:tt)+) => (
         if $cond {
-            warn!($($arg)+);
+            warn!($($arg)+)
         }
     );
     ($($arg:tt)+) => (
-        ::tracing::warn!($($arg)+);
+        ::tracing::warn!($($arg)+)
     )
 }
 
@@ -71,11 +71,11 @@ macro_rules! warn {
 macro_rules! info {
     (cond: $cond:expr, $($arg:tt)+) => (
         if $cond {
-            info!($($arg)+);
+            info!($($arg)+)
         }
     );
     ($($arg:tt)+) => (
-        ::tracing::info!($($arg)+);
+        ::tracing::info!($($arg)+)
     )
 }
 
@@ -84,11 +84,11 @@ macro_rules! info {
 macro_rules! debug {
     (cond: $cond:expr, $($arg:tt)+) => (
         if $cond {
-            debug!($($arg)+);
+            debug!($($arg)+)
         }
     );
     ($($arg:tt)+) => (
-        ::tracing::debug!($($arg)+);
+        ::tracing::debug!($($arg)+)
     )
 }
 
@@ -97,10 +97,10 @@ macro_rules! debug {
 macro_rules! trace {
     (cond: $cond:expr, $($arg:tt)+) => (
         if $cond {
-            trace!($($arg)+);
+            trace!($($arg)+)
         }
     );
     ($($arg:tt)+) => (
-        ::tracing::trace!($($arg)+);
+        ::tracing::trace!($($arg)+)
     )
 }

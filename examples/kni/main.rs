@@ -24,7 +24,7 @@ use capsule::packets::ip::v6::{Ipv6, Ipv6Packet};
 use capsule::packets::ip::ProtocolNumbers;
 use capsule::packets::udp::Udp6;
 use capsule::packets::{Mbuf, Packet, Postmark};
-use capsule::runtime::{self, Outbox, Runtime};
+use capsule::runtime::{self, Runtime};
 use colored::Colorize;
 use signal_hook::consts;
 use signal_hook::flag;
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn route_pkt(packet: Mbuf, kni0: &Outbox) -> Result<Postmark> {
+fn route_pkt(packet: Mbuf) -> Result<Postmark> {
     let ipv6 = e!(e!(packet.parse::<Ethernet>()).parse::<Ipv6>());
 
     match ipv6.next_header() {
@@ -42,24 +42,23 @@ fn route_pkt(packet: Mbuf, kni0: &Outbox) -> Result<Postmark> {
             let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
             let fmt = format!("to kni0: {}", icmp.msg_type()).cyan();
             info!("{}", fmt);
-            let _ = kni0.push(icmp);
-            Ok(Postmark::Emit)
+            Ok(Postmark::emit(icmp))
         }
         ProtocolNumbers::Udp => {
             let udp = e!(ipv6.parse::<Udp6>());
             let fmt = format!("you said: {}", str::from_utf8(udp.data())?).bright_blue();
             info!("{}", fmt);
-            Ok(Postmark::Drop(udp.reset()))
+            Ok(Postmark::drop(udp))
         }
         _ => {
             let fmt = format!("not supported: {}", ipv6.next_header()).red();
             info!("{}", fmt);
-            Ok(Postmark::Drop(ipv6.reset()))
+            Ok(Postmark::drop(ipv6))
         }
     }
 }
 
-fn from_kni(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
+fn from_kni(packet: Mbuf) -> Result<Postmark> {
     let ethernet = e!(packet.parse::<Ethernet>());
     let ipv6 = e!(ethernet.parse::<Ipv6>());
     let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
@@ -67,8 +66,7 @@ fn from_kni(packet: Mbuf, cap0: &Outbox) -> Result<Postmark> {
     let fmt = format!("from kni0: {}", icmp.msg_type()).green();
     info!("{}", fmt);
 
-    let _ = cap0.push(icmp);
-    Ok(Postmark::Emit)
+    Ok(Postmark::emit(icmp))
 }
 
 fn main() -> Result<()> {
@@ -80,11 +78,8 @@ fn main() -> Result<()> {
     let config = runtime::load_config()?;
     let runtime = Runtime::from_config(config)?;
 
-    let kni0 = runtime.ports().get("kni0")?.outbox()?;
-    runtime.set_port_pipeline("cap0", move |packet| route_pkt(packet, &kni0))?;
-
-    let cap0 = runtime.ports().get("cap0")?.outbox()?;
-    runtime.set_port_pipeline("kni0", move |packet| from_kni(packet, &cap0))?;
+    runtime.spawn_rx_tx_pipeline("cap0", route_pkt, Some("kni0"))?;
+    runtime.spawn_rx_tx_pipeline("kni0", from_kni, Some("cap0"))?;
 
     let _guard = runtime.execute()?;
 

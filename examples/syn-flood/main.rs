@@ -17,62 +17,41 @@
 */
 
 use anyhow::Result;
-use async_io::Timer;
 use capsule::net::MacAddr;
 use capsule::packets::ethernet::Ethernet;
 use capsule::packets::ip::v4::Ipv4;
 use capsule::packets::tcp::Tcp4;
 use capsule::packets::{Mbuf, Packet};
-use capsule::runtime::{self, Outbox, Runtime};
-use futures_lite::stream::StreamExt;
+use capsule::runtime::{self, Runtime};
 use signal_hook::consts;
 use signal_hook::flag;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, Level};
+use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-async fn syn_flood(src_mac: MacAddr, cap0: Outbox, term: Arc<AtomicBool>) {
+fn syn_flood(mbuf: Mbuf, src_mac: MacAddr) -> Result<Mbuf> {
     let dst_ip = Ipv4Addr::new(10, 100, 1, 254);
     let dst_mac = MacAddr::new(0x02, 0x00, 0x00, 0xff, 0xff, 0xff);
 
-    // 50ms delay between batches.
-    let mut timer = Timer::interval(Duration::from_millis(50));
+    let mut ethernet = mbuf.push::<Ethernet>()?;
+    ethernet.set_src(src_mac);
+    ethernet.set_dst(dst_mac);
 
-    while !term.load(Ordering::Relaxed) {
-        let _ = timer.next().await;
-        info!("generating 128 SYN packets.");
+    let mut v4 = ethernet.push::<Ipv4>()?;
+    v4.set_src(rand::random::<u32>().into());
+    v4.set_dst(dst_ip);
 
-        match Mbuf::alloc_bulk(128) {
-            Ok(mbufs) => mbufs
-                .into_iter()
-                .map(|mbuf| -> Result<Mbuf> {
-                    let mut ethernet = mbuf.push::<Ethernet>()?;
-                    ethernet.set_src(src_mac);
-                    ethernet.set_dst(dst_mac);
+    let mut tcp = v4.push::<Tcp4>()?;
+    tcp.set_syn();
+    tcp.set_seq_no(1);
+    tcp.set_window(10);
+    tcp.set_dst_port(80);
+    tcp.reconcile_all();
 
-                    let mut v4 = ethernet.push::<Ipv4>()?;
-                    v4.set_src(rand::random::<u32>().into());
-                    v4.set_dst(dst_ip);
-
-                    let mut tcp = v4.push::<Tcp4>()?;
-                    tcp.set_syn();
-                    tcp.set_seq_no(1);
-                    tcp.set_window(10);
-                    tcp.set_dst_port(80);
-                    tcp.reconcile_all();
-
-                    Ok(tcp.reset())
-                })
-                .filter_map(|res| res.ok())
-                .for_each(|mbuf| {
-                    let _ = cap0.push(mbuf);
-                }),
-            Err(err) => error!(?err),
-        }
-    }
+    Ok(tcp.reset())
 }
 
 fn main() -> Result<()> {
@@ -87,13 +66,15 @@ fn main() -> Result<()> {
     let term = Arc::new(AtomicBool::new(false));
 
     let cap0 = runtime.ports().get("cap0")?;
-    let outbox = cap0.outbox()?;
     let src_mac = cap0.mac_addr();
 
-    runtime
-        .lcores()
-        .get(1)?
-        .spawn(syn_flood(src_mac, outbox, term.clone()));
+    cap0.spawn_tx_pipeline(runtime.lcores(),
+                           128,
+                           Some(Duration::from_millis(50)),
+                           move |mbuf, ()| {
+                               syn_flood(mbuf, src_mac.clone())
+                           },
+        || {()})?;
 
     let _guard = runtime.execute()?;
 
