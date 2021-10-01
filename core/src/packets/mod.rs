@@ -367,9 +367,9 @@ impl<T> Deref for Immutable<'_, T> {
 #[derive(Debug)]
 pub struct Postmark {
     /// Packet(s) emitted through a port TX.
-    pub(crate) emit: Vec<Mbuf>,
+    pub emit: Vec<Mbuf>,
     /// Packet intentionally dropped.
-    pub(crate) drop: Option<Mbuf>,
+    pub drop: Option<Mbuf>,
 }
 
 impl Postmark {
