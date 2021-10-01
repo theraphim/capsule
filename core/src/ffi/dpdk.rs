@@ -237,9 +237,9 @@ where
     return match result {
         Err(err) => {
             error!(lcore = ?LcoreId::current(), error = ?err, "failed to execute closure.");
-            -1
+            -2
         },
-        Ok(None) => 0,
+        Ok(None) => -1,
         Ok(Some(val)) => val
     }
 }
@@ -288,8 +288,8 @@ pub(crate) fn eal_get_lcore_state(worker_id: LcoreId) -> Result<LcoreState> {
 /// Ignores the return value.
 pub(crate) fn eal_wait_lcore(worker_id: LcoreId) -> Result<Option<i32>> {
     match unsafe { cffi::rte_eal_wait_lcore(worker_id.0) }.into() {
-        -1 => Err(anyhow!("LCore function returned an error")),
-        0 => Ok(None),
+        -2 => Err(anyhow!("LCore function returned an error")),
+        -1 => Ok(None),
         val => Ok(Some(val))
     }
 }
