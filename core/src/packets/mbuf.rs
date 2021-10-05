@@ -393,6 +393,11 @@ impl Mbuf {
             .collect::<Vec<_>>();
         dpdk::pktmbuf_free_bulk(&mut ptrs);
     }
+
+    /// Frees the message buffers referenced by the pointers in bulk.
+    pub(crate) fn free_bulk_ptrs(ptrs: &mut Vec<MbufPtr>) {
+        dpdk::pktmbuf_free_bulk(ptrs);
+    }
 }
 
 impl fmt::Debug for Mbuf {

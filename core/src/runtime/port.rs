@@ -106,7 +106,7 @@ impl Port {
             let pipeline_fn = pipeline_fn.clone();
             let thread_local_creator_fn = thread_local_creator_fn.clone();
 
-            debug!(port = ?self.name, lcore = ?lcore.id(), "spawning rx loop.");
+            debug!(port = ?self.name, lcore = ?lcore.id(), "spawning rx/tx pipeline.");
 
             let rx_queue_id: PortQueueId = index.into();
             // get tx queue ID based on queue ID on the current port
@@ -157,7 +157,7 @@ impl Port {
             let pipeline_fn = pipeline_fn.clone();
             let thread_local_creator_fn = thread_local_creator_fn.clone();
 
-            debug!(port = ?self.name, lcore = ?lcore.id(), "spawning rx loop.");
+            debug!(port = ?self.name, lcore = ?lcore.id(), "spawning tx pipeline.");
 
             let port_id = self.port_id.clone();
             let tx_queue_id: PortQueueId = index.clone().into();
@@ -244,10 +244,10 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
     let txq = PortTxQueue { port_id: tx_port_id, queue_id: tx_queue_id };
 
     let mut ptrs = Vec::with_capacity(batch_size);
+    let mut emits = Vec::with_capacity(batch_size);
+    let mut drops = Vec::with_capacity(batch_size);
 
     while !shutdown_listener.is_triggered() {
-        let mut emits = Vec::with_capacity(batch_size);
-        let mut drops = Vec::with_capacity(batch_size);
         rxq.receive(&mut ptrs);
 
         for ptr in ptrs.drain(..) {
@@ -265,12 +265,12 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
 
         // Drop drops
         if !drops.is_empty() {
-            Mbuf::free_bulk(drops);
+            Mbuf::free_bulk_ptrs(&mut drops.drain(..).map(Mbuf::into_easyptr).collect());
         }
 
         // Send emits
         if !emits.is_empty() {
-            txq.transmit(emits);
+            txq.transmit_ptrs(&mut emits.drain(..).map(Mbuf::into_easyptr).collect());
         }
     }
 }
