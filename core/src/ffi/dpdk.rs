@@ -142,6 +142,12 @@ pub(crate) fn mempool_in_use_count(mp: &MempoolPtr) -> usize {
     unsafe { cffi::rte_mempool_in_use_count(mp.deref()) as usize }
 }
 
+/// Returns the number of entries in the mempool.
+#[allow(dead_code)]
+pub(crate) fn mempool_avail_count(mp: &MempoolPtr) -> usize {
+    unsafe { cffi::rte_mempool_avail_count(mp.deref()) as usize }
+}
+
 /// Frees a mempool.
 pub(crate) fn mempool_free(mp: &mut MempoolPtr) {
     unsafe { cffi::rte_mempool_free(mp.deref_mut()) };
@@ -304,6 +310,9 @@ impl PortId {
     pub(crate) fn socket(self) -> SocketId {
         unsafe { cffi::rte_eth_dev_socket_id(self.0).into() }
     }
+
+    /// Returns the port ID
+    pub(crate) fn id(self) -> u16 { self.0 }
 }
 
 impl fmt::Debug for PortId {
@@ -531,6 +540,11 @@ pub(crate) fn eth_dev_configure(
 #[derive(Copy, Clone)]
 pub(crate) struct PortQueueId(u16);
 
+impl PortQueueId {
+    /// Returns the queue ID
+    pub(crate) fn id(self) -> u16 { self.0 }
+}
+
 impl fmt::Debug for PortQueueId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "q{}", self.0)
@@ -723,6 +737,16 @@ pub(crate) fn eth_dev_start(port_id: PortId) -> Result<()> {
 pub(crate) fn eth_dev_stop(port_id: PortId) {
     unsafe {
         cffi::rte_eth_dev_stop(port_id.0);
+    }
+}
+
+/// Get port statistics
+pub(crate) fn eth_stats_get(port_id: PortId) -> Result<cffi::rte_eth_stats> {
+    let mut stats = cffi::rte_eth_stats::default();
+    unsafe {
+        cffi::rte_eth_stats_get(port_id.0, &mut stats)
+            .into_result(DpdkError::from_errno)
+            .map(|_| stats)
     }
 }
 

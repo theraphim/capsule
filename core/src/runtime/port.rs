@@ -29,6 +29,8 @@ use thiserror::Error;
 use triggered::Listener;
 use std::time::Duration;
 use std::thread::sleep;
+#[cfg(feature = "metrics")]
+use metrics::{histogram, gauge};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -78,6 +80,25 @@ impl Port {
     /// Returns whether the port has multicast mode enabled.
     pub fn multicast(&self) -> bool {
         dpdk::eth_allmulticast_get(self.port_id)
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects/updates DPDK port metrics
+    pub(crate) fn collect_dpdk_metrics(&self) -> Result<()> {
+        let port_stats = dpdk::eth_stats_get(self.port_id)?;
+        let port_gauge = |name: &'static str, value| {
+            gauge!(format!("port.dpdk.{}", name), value, "port_id" => self.port_id.id().to_string());
+        };
+        port_gauge("rx_packets", port_stats.ipackets as f64);
+        port_gauge("rx_packets", port_stats.ipackets as f64);
+        port_gauge("tx_packets", port_stats.opackets as f64);
+        port_gauge("rx_bytes", port_stats.ibytes as f64);
+        port_gauge("tx_bytes", port_stats.obytes as f64);
+        port_gauge("rx_missed", port_stats.imissed as f64);
+        port_gauge("rx_errors", port_stats.ierrors as f64);
+        port_gauge("tx_errors", port_stats.oerrors as f64);
+        port_gauge("port.dpdk.rx_mbuf_errors", port_stats.rx_nombuf as f64);
+        Ok(())
     }
 
     /// Spawns an infinite RX->TX pipeline with the given function and optionally a different port
@@ -221,6 +242,13 @@ impl PortRxQueue {
     /// Receives a burst of packets, up to the `Vec`'s capacity.
     pub(crate) fn receive(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_rx_burst(self.port_id, self.queue_id, mbufs);
+        #[cfg(feature = "metrics")]
+        // Record metrics histogram for the size of the burst received to track
+        // performance (the more packets are in the burst, the worse is the performance as it's not
+        // being picked up fast enough to avoid latency)
+        histogram!("port.rx_burst_size", mbufs.len() as f64,
+                   "port_id" => self.port_id.id().to_string(),
+                   "queue_id" => self.queue_id.id().to_string());
     }
 }
 
@@ -329,8 +357,17 @@ impl PortTxQueue {
     ///
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit_ptrs(&self, mbufs: &mut Vec<MbufPtr>) {
+        #[cfg(feature = "metrics")]
+        // Record the amount of mbufs sent in each burst
+        histogram!("port.tx_burst_size", mbufs.len() as f64,
+                   "port_id" => self.port_id.id().to_string(),
+                   "queue_id" => self.queue_id.id().to_string());
         dpdk::eth_tx_burst(self.port_id, self.queue_id, mbufs);
-
+        #[cfg(feature = "metrics")]
+        // Record the number of mbufs dropped because of full TX queue
+        histogram!("port.tx_excess_drop", mbufs.len() as f64,
+                   "port_id" => self.port_id.id().to_string(),
+                   "queue_id" => self.queue_id.id().to_string());
         if !mbufs.is_empty() {
             // tx queue is full, we have to drop the excess.
             dpdk::pktmbuf_free_bulk(mbufs);

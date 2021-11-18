@@ -128,6 +128,16 @@ impl Runtime {
         })
     }
 
+    #[cfg(feature = "metrics")]
+    /// Collects/updates DPDK metrics
+    pub fn collect_dpdk_metrics(&self) -> Result<()> {
+        self.mempool.collect_dpdk_metrics();
+        for port in self.ports.iter() {
+            port.collect_dpdk_metrics()?;
+        }
+        Ok(())
+    }
+
     /// Spawns an infinite RX->TX pipeline with the given function, thread locals and optionally a different port
     /// for TX
     pub fn spawn_rx_tx_pipeline_with_thread_locals<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
