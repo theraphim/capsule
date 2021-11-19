@@ -30,7 +30,7 @@ use triggered::Listener;
 use std::time::Duration;
 use std::thread::sleep;
 #[cfg(feature = "metrics")]
-use metrics::{histogram, gauge};
+use metrics::{gauge, counter};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -243,12 +243,15 @@ impl PortRxQueue {
     pub(crate) fn receive(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_rx_burst(self.port_id, self.queue_id, mbufs);
         #[cfg(feature = "metrics")]
-        // Record metrics histogram for the size of the burst received to track
-        // performance (the more packets are in the burst, the worse is the performance as it's not
-        // being picked up fast enough to avoid latency)
-        histogram!("port.rx_burst_size", mbufs.len() as f64,
-                   "port_id" => self.port_id.id().to_string(),
-                   "queue_id" => self.queue_id.id().to_string());
+        // Record metrics for the size of the burst received to track
+        // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
+        if mbufs.len() > 0 {
+            counter!("port.rx_burst_nonempty", 1,
+                "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
+        } else {
+            counter!("port.rx_burst_empty", 1,
+                "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
+        }
     }
 }
 
@@ -358,17 +361,13 @@ impl PortTxQueue {
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit_ptrs(&self, mbufs: &mut Vec<MbufPtr>) {
         #[cfg(feature = "metrics")]
-        // Record the amount of mbufs sent in each burst
-        histogram!("port.tx_burst_size", mbufs.len() as f64,
-                   "port_id" => self.port_id.id().to_string(),
-                   "queue_id" => self.queue_id.id().to_string());
         dpdk::eth_tx_burst(self.port_id, self.queue_id, mbufs);
         #[cfg(feature = "metrics")]
-        // Record the number of mbufs dropped because of full TX queue
-        histogram!("port.tx_excess_drop", mbufs.len() as f64,
+        if !mbufs.is_empty() {
+            // Record the number of mbufs dropped because of full TX queue
+            counter!("port.tx_excess_dropped", mbufs.len() as u64,
                    "port_id" => self.port_id.id().to_string(),
                    "queue_id" => self.queue_id.id().to_string());
-        if !mbufs.is_empty() {
             // tx queue is full, we have to drop the excess.
             dpdk::pktmbuf_free_bulk(mbufs);
         }
