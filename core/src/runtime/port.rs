@@ -30,7 +30,7 @@ use triggered::Listener;
 use std::time::Duration;
 use std::thread::sleep;
 #[cfg(feature = "metrics")]
-use metrics::{gauge, counter};
+use metrics::{gauge};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -242,16 +242,6 @@ impl PortRxQueue {
     /// Receives a burst of packets, up to the `Vec`'s capacity.
     pub(crate) fn receive(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_rx_burst(self.port_id, self.queue_id, mbufs);
-        #[cfg(feature = "metrics")]
-        // Record metrics for the size of the burst received to track
-        // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
-        if mbufs.len() > 0 {
-            counter!("port.rx_burst_nonempty", 1,
-                "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
-        } else {
-            counter!("port.rx_burst_empty", 1,
-                "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
-        }
     }
 }
 
@@ -360,17 +350,7 @@ impl PortTxQueue {
     ///
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit_ptrs(&self, mbufs: &mut Vec<MbufPtr>) {
-        #[cfg(feature = "metrics")]
         dpdk::eth_tx_burst(self.port_id, self.queue_id, mbufs);
-        #[cfg(feature = "metrics")]
-        if !mbufs.is_empty() {
-            // Record the number of mbufs dropped because of full TX queue
-            counter!("port.tx_excess_dropped", mbufs.len() as u64,
-                   "port_id" => self.port_id.id().to_string(),
-                   "queue_id" => self.queue_id.id().to_string());
-            // tx queue is full, we have to drop the excess.
-            dpdk::pktmbuf_free_bulk(mbufs);
-        }
     }
 }
 
