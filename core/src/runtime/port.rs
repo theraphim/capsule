@@ -30,7 +30,9 @@ use triggered::Listener;
 use std::time::Duration;
 use std::thread::sleep;
 #[cfg(feature = "metrics")]
-use metrics::{gauge};
+use metrics::{gauge, counter};
+#[cfg(feature = "metrics")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -236,12 +238,48 @@ impl fmt::Debug for Port {
 pub(crate) struct PortRxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
+    #[cfg(feature = "metrics")]
+    stat_cnt_burst_nonempty: AtomicU64,
+    #[cfg(feature = "metrics")]
+    stat_cnt_burst_empty: AtomicU64,
 }
 
 impl PortRxQueue {
+    pub(crate) fn new(port_id: PortId, queue_id: PortQueueId) -> Self {
+        #[cfg(feature = "metrics")]
+        return Self {
+            port_id,
+            queue_id,
+            stat_cnt_burst_nonempty: AtomicU64::new(0),
+            stat_cnt_burst_empty: AtomicU64::new(0),
+        };
+        #[cfg(not(feature = "metrics"))]
+        return Self {
+            port_id,
+            queue_id,
+        };
+    }
+
     /// Receives a burst of packets, up to the `Vec`'s capacity.
     pub(crate) fn receive(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_rx_burst(self.port_id, self.queue_id, mbufs);
+        #[cfg(feature = "metrics")]
+        // Record metrics for the size of the burst received to track
+        // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
+        if mbufs.len() > 0 {
+            self.stat_cnt_burst_nonempty.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stat_cnt_burst_empty.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects queue metrics
+    pub(crate) fn collect_metrics(&self) {
+        counter!("port.rx_burst_nonempty", self.stat_cnt_burst_nonempty.swap(0, Ordering::Relaxed),
+            "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
+        counter!("port.rx_burst_empty", self.stat_cnt_burst_empty.swap(0, Ordering::Relaxed),
+            "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
     }
 }
 
@@ -261,8 +299,8 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
 {
     let mut thread_locals = thread_local_creator_fn();
 
-    let rxq = PortRxQueue { port_id: rx_port_id, queue_id: rx_queue_id };
-    let txq = PortTxQueue { port_id: tx_port_id, queue_id: tx_queue_id };
+    let rxq = PortRxQueue::new(rx_port_id, rx_queue_id);
+    let txq = PortTxQueue::new(tx_port_id, tx_queue_id);
 
     let mut ptrs = Vec::with_capacity(batch_size);
     let mut emits = Vec::with_capacity(batch_size);
@@ -308,7 +346,7 @@ fn tx_pipeline_loop<PipelineFn, ThreadLocal>(
     PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf> + Clone + Send + Sync + 'static,
     ThreadLocal: Send + 'static
 {
-    let txq = PortTxQueue { port_id: tx_port_id, queue_id: tx_queue_id };
+    let txq = PortTxQueue::new(tx_port_id, tx_queue_id);
 
     while !shutdown_listener.is_triggered() {
         match Mbuf::alloc_bulk(batch_size) {
@@ -335,9 +373,25 @@ fn tx_pipeline_loop<PipelineFn, ThreadLocal>(
 pub(crate) struct PortTxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
+    #[cfg(feature = "metrics")]
+    stat_cnt_excess_drop: AtomicU64,
 }
 
 impl PortTxQueue {
+    pub(crate) fn new(port_id: PortId, queue_id: PortQueueId) -> Self {
+        #[cfg(feature = "metrics")]
+        return Self {
+            port_id,
+            queue_id,
+            stat_cnt_excess_drop: AtomicU64::new(0),
+        };
+        #[cfg(not(feature = "metrics"))]
+            return Self {
+            port_id,
+            queue_id,
+        };
+    }
+
     /// Transmits a burst of packets.
     ///
     /// If the TX is full, the excess packets are dropped.
@@ -351,6 +405,21 @@ impl PortTxQueue {
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit_ptrs(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_tx_burst(self.port_id, self.queue_id, mbufs);
+        if !mbufs.is_empty() {
+            #[cfg(feature = "metrics")]
+            // Record the number of mbufs dropped because of full TX queue
+            self.stat_cnt_excess_drop.fetch_add(mbufs.len() as u64, Ordering::Relaxed);
+            // tx queue is full, we have to drop the excess.
+            dpdk::pktmbuf_free_bulk(mbufs);
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects queue metrics
+    pub(crate) fn collect_metrics(&self) {
+        counter!("port.tx_excess_dropped", self.stat_cnt_excess_drop.swap(0, Ordering::Relaxed),
+                   "port_id" => self.port_id.id().to_string(),
+                   "queue_id" => self.queue_id.id().to_string());
     }
 }
 
@@ -745,10 +814,10 @@ mod tests {
         let mut packets = Vec::with_capacity(4);
         assert_eq!(0, packets.len());
 
-        let rxq = PortRxQueue {
-            port_id: port.port_id,
-            queue_id: 0.into(),
-        };
+        let rxq = PortRxQueue::new(
+            port.port_id,
+            0.into(),
+        );
 
         rxq.receive(&mut packets);
         assert_eq!(4, packets.len());
