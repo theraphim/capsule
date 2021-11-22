@@ -32,7 +32,9 @@ use std::thread::sleep;
 #[cfg(feature = "metrics")]
 use metrics::{gauge, counter};
 #[cfg(feature = "metrics")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::runtime::port_metrics::{PORT_QUEUE_STATS, PortRxQueueStats, PortTxQueueStats};
+#[cfg(feature = "metrics")]
+use std::sync::atomic::{Ordering};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -85,11 +87,12 @@ impl Port {
     }
 
     #[cfg(feature = "metrics")]
-    /// Collects/updates DPDK port metrics
-    pub(crate) fn collect_dpdk_metrics(&self) -> Result<()> {
+    /// Collects/updates port and assosciated queue metrics
+    pub(crate) fn collect_metrics(&self) -> Result<()> {
         let port_stats = dpdk::eth_stats_get(self.port_id)?;
         let port_gauge = |name: &'static str, value| {
-            gauge!(format!("port.dpdk.{}", name), value, "port_id" => self.port_id.id().to_string());
+            gauge!(format!("port.dpdk.{}", name), value,
+                "port_id" => self.port_id.id().to_string());
         };
         port_gauge("rx_packets", port_stats.ipackets as f64);
         port_gauge("rx_packets", port_stats.ipackets as f64);
@@ -100,6 +103,14 @@ impl Port {
         port_gauge("rx_errors", port_stats.ierrors as f64);
         port_gauge("tx_errors", port_stats.oerrors as f64);
         port_gauge("port.dpdk.rx_mbuf_errors", port_stats.rx_nombuf as f64);
+        for (index, stat) in PORT_QUEUE_STATS[self.port_id.id() as usize][0..self.lcores.len()].iter().enumerate() {
+            counter!("port.rx_burst_nonempty", stat.rx.cnt_burst_nonempty.swap(0, Ordering::Relaxed),
+                "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+            counter!("port.rx_burst_empty", stat.rx.cnt_burst_empty.swap(0, Ordering::Relaxed),
+                "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+            counter!("port.tx_excess_dropped", stat.tx.cnt_excess_drop.swap(0, Ordering::Relaxed),
+                   "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+        }
         Ok(())
     }
 
@@ -239,9 +250,7 @@ pub(crate) struct PortRxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
     #[cfg(feature = "metrics")]
-    stat_cnt_burst_nonempty: AtomicU64,
-    #[cfg(feature = "metrics")]
-    stat_cnt_burst_empty: AtomicU64,
+    stats: &'static PortRxQueueStats,
 }
 
 impl PortRxQueue {
@@ -250,8 +259,7 @@ impl PortRxQueue {
         return Self {
             port_id,
             queue_id,
-            stat_cnt_burst_nonempty: AtomicU64::new(0),
-            stat_cnt_burst_empty: AtomicU64::new(0),
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].rx
         };
         #[cfg(not(feature = "metrics"))]
         return Self {
@@ -267,19 +275,10 @@ impl PortRxQueue {
         // Record metrics for the size of the burst received to track
         // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
         if mbufs.len() > 0 {
-            self.stat_cnt_burst_nonempty.fetch_add(1, Ordering::Relaxed);
+            self.stats.cnt_burst_nonempty.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.stat_cnt_burst_empty.fetch_add(1, Ordering::Relaxed);
+            self.stats.cnt_burst_empty.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    #[cfg(feature = "metrics")]
-    /// Collects queue metrics
-    pub(crate) fn collect_metrics(&self) {
-        counter!("port.rx_burst_nonempty", self.stat_cnt_burst_nonempty.swap(0, Ordering::Relaxed),
-            "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
-        counter!("port.rx_burst_empty", self.stat_cnt_burst_empty.swap(0, Ordering::Relaxed),
-            "port_id" => self.port_id.id().to_string(), "queue_id" => self.queue_id.id().to_string());
     }
 }
 
@@ -374,7 +373,7 @@ pub(crate) struct PortTxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
     #[cfg(feature = "metrics")]
-    stat_cnt_excess_drop: AtomicU64,
+    stats: &'static PortTxQueueStats,
 }
 
 impl PortTxQueue {
@@ -383,10 +382,10 @@ impl PortTxQueue {
         return Self {
             port_id,
             queue_id,
-            stat_cnt_excess_drop: AtomicU64::new(0),
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].tx
         };
         #[cfg(not(feature = "metrics"))]
-            return Self {
+        return Self {
             port_id,
             queue_id,
         };
@@ -408,18 +407,10 @@ impl PortTxQueue {
         if !mbufs.is_empty() {
             #[cfg(feature = "metrics")]
             // Record the number of mbufs dropped because of full TX queue
-            self.stat_cnt_excess_drop.fetch_add(mbufs.len() as u64, Ordering::Relaxed);
+            self.stats.cnt_excess_drop.fetch_add(mbufs.len() as u64, Ordering::Relaxed);
             // tx queue is full, we have to drop the excess.
             dpdk::pktmbuf_free_bulk(mbufs);
         }
-    }
-
-    #[cfg(feature = "metrics")]
-    /// Collects queue metrics
-    pub(crate) fn collect_metrics(&self) {
-        counter!("port.tx_excess_dropped", self.stat_cnt_excess_drop.swap(0, Ordering::Relaxed),
-                   "port_id" => self.port_id.id().to_string(),
-                   "queue_id" => self.queue_id.id().to_string());
     }
 }
 

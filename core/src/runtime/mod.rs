@@ -25,6 +25,8 @@ mod mempool;
 #[cfg_attr(docsrs, doc(cfg(feature = "pcap-dump")))]
 mod pcap_dump;
 mod port;
+#[cfg(feature = "metrics")]
+mod port_metrics;
 
 pub use self::config::*;
 pub(crate) use self::lcore::*;
@@ -129,11 +131,11 @@ impl Runtime {
     }
 
     #[cfg(feature = "metrics")]
-    /// Collects/updates DPDK metrics
-    pub fn collect_dpdk_metrics(&self) -> Result<()> {
-        self.mempool.collect_dpdk_metrics();
+    /// Collects/updates metrics
+    pub fn collect_metrics(&self) -> Result<()> {
+        self.mempool.collect_metrics();
         for port in self.ports.iter() {
-            port.collect_dpdk_metrics()?;
+            port.collect_metrics()?;
         }
         Ok(())
     }

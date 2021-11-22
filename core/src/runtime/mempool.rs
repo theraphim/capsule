@@ -94,7 +94,7 @@ impl Mempool {
 
     #[cfg(feature = "metrics")]
     /// Collects/updates DPDK mempool metrics
-    pub(crate) fn collect_dpdk_metrics(&self) {
+    pub(crate) fn collect_metrics(&self) {
         gauge!("mempool.dpdk.in_use_cnt", dpdk::mempool_in_use_count(&self.ptr) as f64, "mempool" => self.name.clone());
         gauge!("mempool.dpdk.avail_cnt", dpdk::mempool_avail_count(&self.ptr) as f64, "mempool" => self.name.clone());
     }
