@@ -29,6 +29,12 @@ use thiserror::Error;
 use triggered::Listener;
 use std::time::Duration;
 use std::thread::sleep;
+#[cfg(feature = "metrics")]
+use metrics::{gauge, counter};
+#[cfg(feature = "metrics")]
+use crate::runtime::port_metrics::{PORT_QUEUE_STATS, PortRxQueueStats, PortTxQueueStats};
+#[cfg(feature = "metrics")]
+use std::sync::atomic::{Ordering};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -78,6 +84,34 @@ impl Port {
     /// Returns whether the port has multicast mode enabled.
     pub fn multicast(&self) -> bool {
         dpdk::eth_allmulticast_get(self.port_id)
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects/updates port and assosciated queue metrics
+    pub(crate) fn collect_metrics(&self) -> Result<()> {
+        let port_stats = dpdk::eth_stats_get(self.port_id)?;
+        let port_gauge = |name: &'static str, value| {
+            gauge!(format!("port.dpdk.{}", name), value,
+                "port_id" => self.port_id.id().to_string());
+        };
+        port_gauge("rx_packets", port_stats.ipackets as f64);
+        port_gauge("rx_packets", port_stats.ipackets as f64);
+        port_gauge("tx_packets", port_stats.opackets as f64);
+        port_gauge("rx_bytes", port_stats.ibytes as f64);
+        port_gauge("tx_bytes", port_stats.obytes as f64);
+        port_gauge("rx_missed", port_stats.imissed as f64);
+        port_gauge("rx_errors", port_stats.ierrors as f64);
+        port_gauge("tx_errors", port_stats.oerrors as f64);
+        port_gauge("port.dpdk.rx_mbuf_errors", port_stats.rx_nombuf as f64);
+        for (index, stat) in PORT_QUEUE_STATS[self.port_id.id() as usize][0..self.lcores.len()].iter().enumerate() {
+            counter!("port.rx_burst_nonempty", stat.rx.cnt_burst_nonempty.swap(0, Ordering::Relaxed),
+                "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+            counter!("port.rx_burst_empty", stat.rx.cnt_burst_empty.swap(0, Ordering::Relaxed),
+                "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+            counter!("port.tx_excess_dropped", stat.tx.cnt_excess_drop.swap(0, Ordering::Relaxed),
+                   "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
+        }
+        Ok(())
     }
 
     /// Spawns an infinite RX->TX pipeline with the given function and optionally a different port
@@ -215,12 +249,36 @@ impl fmt::Debug for Port {
 pub(crate) struct PortRxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
+    #[cfg(feature = "metrics")]
+    stats: &'static PortRxQueueStats,
 }
 
 impl PortRxQueue {
+    pub(crate) fn new(port_id: PortId, queue_id: PortQueueId) -> Self {
+        #[cfg(feature = "metrics")]
+        return Self {
+            port_id,
+            queue_id,
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].rx
+        };
+        #[cfg(not(feature = "metrics"))]
+        return Self {
+            port_id,
+            queue_id,
+        };
+    }
+
     /// Receives a burst of packets, up to the `Vec`'s capacity.
     pub(crate) fn receive(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_rx_burst(self.port_id, self.queue_id, mbufs);
+        #[cfg(feature = "metrics")]
+        // Record metrics for the size of the burst received to track
+        // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
+        if mbufs.len() > 0 {
+            self.stats.cnt_burst_nonempty.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.cnt_burst_empty.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -240,8 +298,8 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
 {
     let mut thread_locals = thread_local_creator_fn();
 
-    let rxq = PortRxQueue { port_id: rx_port_id, queue_id: rx_queue_id };
-    let txq = PortTxQueue { port_id: tx_port_id, queue_id: tx_queue_id };
+    let rxq = PortRxQueue::new(rx_port_id, rx_queue_id);
+    let txq = PortTxQueue::new(tx_port_id, tx_queue_id);
 
     let mut ptrs = Vec::with_capacity(batch_size);
     let mut emits = Vec::with_capacity(batch_size);
@@ -287,7 +345,7 @@ fn tx_pipeline_loop<PipelineFn, ThreadLocal>(
     PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf> + Clone + Send + Sync + 'static,
     ThreadLocal: Send + 'static
 {
-    let txq = PortTxQueue { port_id: tx_port_id, queue_id: tx_queue_id };
+    let txq = PortTxQueue::new(tx_port_id, tx_queue_id);
 
     while !shutdown_listener.is_triggered() {
         match Mbuf::alloc_bulk(batch_size) {
@@ -314,9 +372,25 @@ fn tx_pipeline_loop<PipelineFn, ThreadLocal>(
 pub(crate) struct PortTxQueue {
     port_id: PortId,
     queue_id: PortQueueId,
+    #[cfg(feature = "metrics")]
+    stats: &'static PortTxQueueStats,
 }
 
 impl PortTxQueue {
+    pub(crate) fn new(port_id: PortId, queue_id: PortQueueId) -> Self {
+        #[cfg(feature = "metrics")]
+        return Self {
+            port_id,
+            queue_id,
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].tx
+        };
+        #[cfg(not(feature = "metrics"))]
+        return Self {
+            port_id,
+            queue_id,
+        };
+    }
+
     /// Transmits a burst of packets.
     ///
     /// If the TX is full, the excess packets are dropped.
@@ -330,8 +404,10 @@ impl PortTxQueue {
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit_ptrs(&self, mbufs: &mut Vec<MbufPtr>) {
         dpdk::eth_tx_burst(self.port_id, self.queue_id, mbufs);
-
         if !mbufs.is_empty() {
+            #[cfg(feature = "metrics")]
+            // Record the number of mbufs dropped because of full TX queue
+            self.stats.cnt_excess_drop.fetch_add(mbufs.len() as u64, Ordering::Relaxed);
             // tx queue is full, we have to drop the excess.
             dpdk::pktmbuf_free_bulk(mbufs);
         }
@@ -729,10 +805,10 @@ mod tests {
         let mut packets = Vec::with_capacity(4);
         assert_eq!(0, packets.len());
 
-        let rxq = PortRxQueue {
-            port_id: port.port_id,
-            queue_id: 0.into(),
-        };
+        let rxq = PortRxQueue::new(
+            port.port_id,
+            0.into(),
+        );
 
         rxq.receive(&mut packets);
         assert_eq!(4, packets.len());

@@ -25,6 +25,8 @@ mod mempool;
 #[cfg_attr(docsrs, doc(cfg(feature = "pcap-dump")))]
 mod pcap_dump;
 mod port;
+#[cfg(feature = "metrics")]
+mod port_metrics;
 
 pub use self::config::*;
 pub(crate) use self::lcore::*;
@@ -126,6 +128,16 @@ impl Runtime {
             #[cfg(feature = "pcap-dump")]
             pcap_dump: ManuallyDrop::new(pcap_dump),
         })
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects/updates metrics
+    pub fn collect_metrics(&self) -> Result<()> {
+        self.mempool.collect_metrics();
+        for port in self.ports.iter() {
+            port.collect_metrics()?;
+        }
+        Ok(())
     }
 
     /// Spawns an infinite RX->TX pipeline with the given function, thread locals and optionally a different port

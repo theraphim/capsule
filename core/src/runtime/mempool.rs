@@ -24,11 +24,14 @@ use std::cell::Cell;
 use std::fmt;
 use std::ptr::{self, NonNull};
 use thiserror::Error;
+#[cfg(feature = "metrics")]
+use metrics::{gauge};
 
 /// A memory pool is an allocator of message buffers, or `Mbuf`. For best
 /// performance, each socket should have a dedicated `Mempool`.
 pub struct Mempool {
     ptr: MempoolPtr,
+    name: String,
 }
 
 impl Mempool {
@@ -56,7 +59,7 @@ impl Mempool {
 
         info!(?name, "pool created.");
 
-        Ok(Self { ptr })
+        Ok(Self { ptr, name })
     }
 
     /// Returns the raw pointer.
@@ -87,6 +90,13 @@ impl Mempool {
     #[inline]
     pub(crate) fn socket(&self) -> SocketId {
         self.ptr.socket_id.into()
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Collects/updates DPDK mempool metrics
+    pub(crate) fn collect_metrics(&self) {
+        gauge!("mempool.dpdk.in_use_cnt", dpdk::mempool_in_use_count(&self.ptr) as f64, "mempool" => self.name.clone());
+        gauge!("mempool.dpdk.avail_cnt", dpdk::mempool_avail_count(&self.ptr) as f64, "mempool" => self.name.clone());
     }
 
     /// Returns the thread local mempool pointer.
