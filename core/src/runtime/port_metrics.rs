@@ -20,7 +20,6 @@ pub(crate) struct PortQueueStats {
 }
 
 lazy_static!(
-    // pub(crate) static ref PORT_QUEUE_STATS: Vec<Vec<PortQueueStats>> = vec![vec![PortQueueStats::default(); cffi::RTE_MAX_QUEUES_PER_PORT as usize]; cffi::RTE_RAWDEV_MAX_DEVS as usize];
     pub(crate) static ref PORT_QUEUE_STATS: Vec<Vec<PortQueueStats>> = {
         let mut outer_vec: Vec<Vec<PortQueueStats>> = Vec::with_capacity(cffi::RTE_RAWDEV_MAX_DEVS as usize);
         for _ in 0..cffi::RTE_RAWDEV_MAX_DEVS as usize {
