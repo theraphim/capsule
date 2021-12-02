@@ -41,7 +41,7 @@ pub fn cargo_test_init() {
     TEST_INIT.call_once(|| {
         dpdk::eal_init(vec![
             "capsule_test",
-            "--master-lcore",
+            "--main-lcore",
             "127",
             "--lcores",
             // 2 logical worker cores, pins master core to physical core 0
