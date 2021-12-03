@@ -23,6 +23,90 @@ use std::convert::From;
 use std::fmt;
 use std::ops;
 
+/// The 8-bit unsigned integer in big-endian order.
+///
+/// Used to convert packet fields to host byte order on get and network byte
+/// order on set.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C, packed)]
+pub struct u8be(pub u8);
+
+impl u8be {
+    /// The smallest value that can be represented by this integer type.
+    pub const MIN: u8be = u8be(0);
+}
+
+impl From<u8> for u8be {
+    fn from(item: u8) -> Self {
+        u8be(u8::to_be(item))
+    }
+}
+
+impl From<u8be> for u8 {
+    fn from(item: u8be) -> Self {
+        u8::from_be(item.0)
+    }
+}
+
+impl ops::BitAnd for u8be {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        u8be(self.0 & rhs.0)
+    }
+}
+
+impl ops::BitAndAssign for u8be {
+    fn bitand_assign(&mut self, rhs: Self) {
+        *self = Self(self.0 & rhs.0)
+    }
+}
+
+impl ops::BitOr for u8be {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl ops::BitOrAssign for u8be {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = Self(self.0 | rhs.0)
+    }
+}
+
+impl ops::BitXor for u8be {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self {
+        Self(self.0 ^ rhs.0)
+    }
+}
+
+impl ops::BitXorAssign for u8be {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = Self(self.0 ^ rhs.0)
+    }
+}
+
+impl ops::Not for u8be {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        u8be(!self.0)
+    }
+}
+
+impl fmt::Display for u8be {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let item = self.0;
+        item.fmt(f)
+    }
+}
+
 /// The 16-bit unsigned integer in big-endian order.
 ///
 /// Used to convert packet fields to host byte order on get and network byte
