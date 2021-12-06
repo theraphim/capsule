@@ -233,6 +233,17 @@ impl Mbuf {
         }
     }
 
+    /// Resizes the data buffer to the given len.
+    ///
+    /// Delegates to either `extend` or `shrink`.
+    #[inline]
+    pub fn resize_to(&mut self, offset: usize, len: usize) -> Result<()> {
+        if self.data_len() != len {
+            self.resize(offset, len as isize - self.data_len() as isize)?
+        }
+        Ok(())
+    }
+
     /// Truncates the data buffer to len.
     ///
     /// # Errors
