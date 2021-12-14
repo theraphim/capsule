@@ -24,6 +24,7 @@ use anyhow::{Result, Error};
 use capsule_ffi as cffi;
 use std::fmt;
 use std::mem;
+use std::cmp::min;
 use std::ptr::{self, NonNull};
 use std::slice;
 use thiserror::Error;
@@ -239,7 +240,7 @@ impl Mbuf {
     #[inline]
     pub fn resize_to(&mut self, len: usize) -> Result<()> {
         if self.data_len() != len {
-            self.resize(len, len as isize - self.data_len() as isize)?
+            self.resize(min(self.data_len(), len), len as isize - self.data_len() as isize)?
         }
         Ok(())
     }
