@@ -235,11 +235,11 @@ impl Mbuf {
 
     /// Ensures that the data buffer has the given len.
     ///
-    /// Delegates to `resize` with the `offset` being the tail of the current buffer.
+    /// Delegates to `resize` with the `offset` being the tail of the resized buffer (`len`).
     #[inline]
     pub fn resize_to(&mut self, len: usize) -> Result<()> {
         if self.data_len() != len {
-            self.resize(self.data_len(), len as isize - self.data_len() as isize)?
+            self.resize(len, len as isize - self.data_len() as isize)?
         }
         Ok(())
     }
