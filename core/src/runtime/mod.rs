@@ -195,6 +195,13 @@ pub struct RuntimeGuard {
     runtime: Runtime,
 }
 
+impl RuntimeGuard {
+    /// Get runtime
+    pub fn runtime(&mut self) -> &mut Runtime {
+        &mut self.runtime
+    }
+}
+
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
         info!("shutting down runtime.");
