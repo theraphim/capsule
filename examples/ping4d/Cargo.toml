@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 anyhow = "1.0"
+thiserror = "1.0.30"
 capsule = { version = "0.2", path = "../../core" }
 signal-hook = "0.3"
 tracing = "0.1"

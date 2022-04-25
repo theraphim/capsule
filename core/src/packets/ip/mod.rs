@@ -22,10 +22,12 @@ pub mod v4;
 pub mod v6;
 
 use crate::packets::checksum::PseudoHeader;
-use crate::packets::Packet;
-use anyhow::Result;
+use crate::packets::ethernet::EtherType;
+use crate::packets::ip::v6::Ipv6Error;
+use crate::packets::{MbufError, Packet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use thiserror::Error;
 
 /// [IANA] recommended default TTL for IP.
 ///
@@ -92,8 +94,64 @@ impl fmt::Display for ProtocolNumber {
     }
 }
 
+#[derive(Debug)]
+pub enum IpVersion {
+    IPv4,
+    IPv6,
+}
+
+/*
+   TODO
+   the IpProtocolSpecificError is only done because it would be impossible without negative impls
+   to restrict the IpError on the IpPacket trait as such that it cannot be implemented by errors
+   up the chain using generics. this can be reverted back to being beautiful when negative impls
+   are stable.
+*/
+
+/* /// Trait to distinguish IP packet error types from other errors to prevent conflicts
+trait IpPacketError {} */
+// TODO req negative_impl
+
+/// Generic IP packet error
+#[derive(Error, Debug)]
+pub enum IpError {
+    /// Error returned by the underlying mbuf
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    /// Invalid packet for this parser
+    #[error("not an IP ({expected:?}) packet: {found:?}")]
+    InvalidPacketType {
+        found: EtherType,
+        expected: EtherType,
+    },
+    /// Invalid source IP address version
+    #[error("source address must be {expected:?}")]
+    InvalidSourceAddress { expected: IpVersion },
+    /// Invalid destination IP address version
+    #[error("destination address must be {expected:?}")]
+    InvalidDestinationAddress { expected: IpVersion },
+    /// MTU too small
+    #[error("MTU {found} must be greater than {expected}")]
+    InvalidMtu { found: usize, expected: usize },
+    /// Either IPv4 or IPv6 protocol specific error
+    #[error("Protocol specific error")]
+    ProtocolSpecificError(#[from] IpProtocolSpecificError),
+}
+
+/// Protocol specific error
+// Weird implementation only required because of no negative_impl support
+#[derive(Error, Debug)]
+pub enum IpProtocolSpecificError {
+    #[error("IPv6 error")]
+    V6(#[from] Ipv6Error),
+}
+
+// impl IpPacketError for IpError {} // TODO req negative_impl
+
 /// A trait implemented by IPv4, IPv6 and IPv6 extension packets.
 pub trait IpPacket: Packet {
+    // type IpError: Error + IpPacketError + From<IpError>; // TODO req negative_impl
+
     /// Returns the assigned protocol number of the packet immediately follows.
     ///
     /// For IPv4 packets, this should be the [`protocol`] field. For IPv6 and
@@ -119,7 +177,7 @@ pub trait IpPacket: Packet {
     ///
     /// This lets an upper layer packet like TCP set the source IP address.
     /// on a lower layer packet.
-    fn set_src(&mut self, src: IpAddr) -> Result<()>;
+    fn set_src(&mut self, src: IpAddr) -> Result<(), IpError>;
 
     /// Returns the destination IP address
     fn dst(&self) -> IpAddr;
@@ -128,23 +186,24 @@ pub trait IpPacket: Packet {
     ///
     /// This lets an upper layer packet like TCP set the destination IP address
     /// on a lower layer packet.
-    fn set_dst(&mut self, dst: IpAddr) -> Result<()>;
+    fn set_dst(&mut self, dst: IpAddr) -> Result<(), IpError>;
 
     /// Swaps the source and destination IP addresses
     ///
     /// This lets an upper layer packet like TCP swap the IP addresses
     /// on a lower layer packet.
-    fn swap_addresses(&mut self) -> Result<()> {
+    fn swap_addresses(&mut self) -> Result<(), IpError> {
         let src_addr = self.src();
         self.set_src(self.dst())?;
-        self.set_dst(src_addr)
+        self.set_dst(src_addr)?;
+        Ok(())
     }
 
     /// Returns the pseudo-header for layer 4 checksum computation.
     fn pseudo_header(&self, packet_len: u16, protocol: ProtocolNumber) -> PseudoHeader;
 
     /// Truncates the IP packet to MTU. The data exceeds MTU is lost.
-    fn truncate(&mut self, mtu: usize) -> Result<()>;
+    fn truncate(&mut self, mtu: usize) -> Result<(), IpError>;
 }
 
 /// The common attributes (5-tuple) used to identify an IP based network

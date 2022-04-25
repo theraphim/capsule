@@ -30,15 +30,15 @@ mod port_metrics;
 
 pub use self::config::*;
 pub(crate) use self::lcore::*;
-pub use self::lcore::{Lcore, LcoreMap, LcoreNotFound};
+pub use self::lcore::{Lcore, LcoreMap};
 pub use self::mempool::Mempool;
 pub(crate) use self::mempool::*;
 pub use self::port::{Port, PortError, PortMap};
+use std::error::Error;
 
 use crate::ffi::dpdk::{self, LcoreId};
 use crate::packets::{Mbuf, Postmark};
 use crate::{debug, info};
-use anyhow::Result;
 use std::fmt;
 use std::mem::ManuallyDrop;
 
@@ -74,7 +74,7 @@ impl Runtime {
     }
 
     /// Initializes a new runtime from config settings.
-    pub fn from_config(config: RuntimeConfig) -> Result<Self> {
+    pub fn from_config(config: RuntimeConfig) -> anyhow::Result<Self> {
         info!("starting runtime.");
 
         debug!("initializing EAL ...");
@@ -132,7 +132,7 @@ impl Runtime {
 
     #[cfg(feature = "metrics")]
     /// Collects/updates metrics
-    pub fn collect_metrics(&self) -> Result<()> {
+    pub fn collect_metrics(&self) -> Result<(), PortError> {
         self.mempool.collect_metrics();
         for port in self.ports.iter() {
             port.collect_metrics()?;
@@ -142,42 +142,63 @@ impl Runtime {
 
     /// Spawns an infinite RX->TX pipeline with the given function, thread locals and optionally a different port
     /// for TX
-    pub fn spawn_rx_tx_pipeline_with_thread_locals<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+    pub fn spawn_rx_tx_pipeline_with_thread_locals<
+        PipelineFn,
+        PipelineFnError,
+        ThreadLocalCreatorFn,
+        ThreadLocal,
+    >(
         &self,
         rx_port: &str,
         pipeline_fn: PipelineFn,
         thread_local_creator_fn: ThreadLocalCreatorFn,
-        tx_port: Option<&str>
-    ) -> Result<()>
-        where
-            PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
-            ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
-            ThreadLocal: Send + 'static
+        tx_port: Option<&str>,
+    ) -> Result<(), PortError>
+    where
+        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark, PipelineFnError>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        PipelineFnError: Error,
+        ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+        ThreadLocal: Send + 'static,
     {
         let rx_port_ = self.ports.get(rx_port)?;
         let tx_port_ = match tx_port {
             Some(port_name) => Some(self.ports().get(port_name)?),
-            None => None
+            None => None,
         };
-        rx_port_.spawn_rx_tx_pipeline(self.lcores(), pipeline_fn, thread_local_creator_fn, tx_port_)
+        rx_port_.spawn_rx_tx_pipeline(
+            self.lcores(),
+            pipeline_fn,
+            thread_local_creator_fn,
+            tx_port_,
+        )
     }
 
     /// Spawns an infinite RX->TX pipeline with the given function and optionally a different port
     /// for TX
-    pub fn spawn_rx_tx_pipeline<PipelineFn>(
+    pub fn spawn_rx_tx_pipeline<PipelineFn, PipelineFnError>(
         &self,
         rx_port: &str,
         pipeline_fn: PipelineFn,
-        tx_port: Option<&str>
-    ) -> Result<()>
-        where
-            PipelineFn: Fn(Mbuf) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        tx_port: Option<&str>,
+    ) -> Result<(), PortError>
+    where
+        PipelineFn: Fn(Mbuf) -> Result<Postmark, PipelineFnError> + Clone + Send + Sync + 'static,
+        PipelineFnError: Error,
     {
-       self.spawn_rx_tx_pipeline_with_thread_locals(rx_port, move |mbuf, _| pipeline_fn(mbuf), || (), tx_port)
+        self.spawn_rx_tx_pipeline_with_thread_locals(
+            rx_port,
+            move |mbuf, _| pipeline_fn(mbuf),
+            || (),
+            tx_port,
+        )
     }
 
     /// Starts the runtime execution.
-    pub fn execute(self) -> Result<RuntimeGuard> {
+    pub fn execute(self) -> anyhow::Result<RuntimeGuard> {
         Ok(RuntimeGuard { runtime: self })
     }
 }

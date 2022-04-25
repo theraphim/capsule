@@ -19,15 +19,16 @@
 //! Transmission Control Protocol.
 
 use crate::ensure;
+use crate::packets::checksum::ChecksumError;
 use crate::packets::ip::v4::Ipv4;
 use crate::packets::ip::v6::Ipv6;
-use crate::packets::ip::{Flow, IpPacket, ProtocolNumbers};
+use crate::packets::ip::{Flow, IpError, IpPacket, ProtocolNumber, ProtocolNumbers};
 use crate::packets::types::{u16be, u32be};
-use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
+use crate::packets::{checksum, Internal, MbufError, Packet, SizeOf};
 use std::fmt;
 use std::net::IpAddr;
 use std::ptr::NonNull;
+use thiserror::Error;
 
 // TCP control flag bitmasks.
 const CWR: u8 = 0b1000_0000;
@@ -123,6 +124,18 @@ pub struct Tcp<E: IpPacket> {
     envelope: E,
     header: NonNull<TcpHeader>,
     offset: usize,
+}
+
+#[derive(Error, Debug)]
+pub enum TcpError {
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("ip packet error")]
+    IpPacketError(#[from] IpError),
+    #[error("not a tcp packet: {0}")]
+    InvalidPacketType(ProtocolNumber),
+    #[error("checksum error")]
+    ChecksumError(#[from] ChecksumError),
 }
 
 impl<E: IpPacket> Tcp<E> {
@@ -431,7 +444,7 @@ impl<E: IpPacket> Tcp<E> {
     /// the TCP packet is inside a IPv6 packet, the `src_ip` must be an
     /// Ipv6Addr.
     #[inline]
-    pub fn set_src_ip(&mut self, src_ip: IpAddr) -> Result<()> {
+    pub fn set_src_ip(&mut self, src_ip: IpAddr) -> Result<(), TcpError> {
         let old_ip = self.envelope().src();
         let checksum = checksum::compute_with_ipaddr(self.checksum(), &old_ip, &src_ip)?;
         self.envelope_mut().set_src(src_ip)?;
@@ -452,7 +465,7 @@ impl<E: IpPacket> Tcp<E> {
     /// the TCP packet is inside a IPv6 packet, the `dst_ip` must be an
     /// Ipv6Addr.
     #[inline]
-    pub fn set_dst_ip(&mut self, dst_ip: IpAddr) -> Result<()> {
+    pub fn set_dst_ip(&mut self, dst_ip: IpAddr) -> Result<(), TcpError> {
         let old_ip = self.envelope().dst();
         let checksum = checksum::compute_with_ipaddr(self.checksum(), &old_ip, &dst_ip)?;
         self.envelope_mut().set_dst(dst_ip)?;
@@ -513,6 +526,7 @@ impl<E: IpPacket> Packet for Tcp<E> {
     /// [IPv4]: crate::packets::ip::v4::Ipv4
     /// [IPv6]: crate::packets::ip::v6::Ipv6
     type Envelope = E;
+    type Error = TcpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -557,17 +571,23 @@ impl<E: IpPacket> Packet for Tcp<E> {
     /// [`ProtocolNumbers::Tcp`]: crate::packets::ip::ProtocolNumbers::Tcp
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.next_protocol() == ProtocolNumbers::Tcp,
-            (anyhow!("not a TCP packet."), envelope)
+            (
+                TcpError::InvalidPacketType(envelope.next_protocol()),
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Tcp {
@@ -591,7 +611,7 @@ impl<E: IpPacket> Packet for Tcp<E> {
     /// [`ProtocolNumbers::Tcp`]: crate::packets::ip::ProtocolNumbers::Tcp
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -756,13 +776,13 @@ mod tests {
         let old_checksum = tcp.checksum();
         let new_ip = Ipv4Addr::new(10, 0, 0, 0);
         assert!(tcp.set_src_ip(new_ip.into()).is_ok());
-        assert!(tcp.checksum() != old_checksum);
+        assert_ne!(tcp.checksum(), old_checksum);
         assert_eq!(new_ip.to_string(), tcp.envelope().src().to_string());
 
         let old_checksum = tcp.checksum();
         let new_ip = Ipv4Addr::new(20, 0, 0, 0);
         assert!(tcp.set_dst_ip(new_ip.into()).is_ok());
-        assert!(tcp.checksum() != old_checksum);
+        assert_ne!(tcp.checksum(), old_checksum);
         assert_eq!(new_ip.to_string(), tcp.envelope().dst().to_string());
 
         // can't set v6 addr on a v4 packet

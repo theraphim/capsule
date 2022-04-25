@@ -16,25 +16,36 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use anyhow::{anyhow, Result};
-use capsule::e;
-use capsule::packets::ethernet::{EtherTypes, Ethernet};
+use capsule::packets::ethernet::{EtherType, EtherTypes, Ethernet, EthernetError};
 use capsule::packets::ip::v4::Ipv4;
 use capsule::packets::ip::v6::Ipv6;
-use capsule::packets::ip::IpPacket;
-use capsule::packets::tcp::{Tcp, Tcp4, Tcp6};
-use capsule::packets::{Mbuf, Packet, Postmark};
+use capsule::packets::ip::{IpError, IpPacket};
+use capsule::packets::tcp::{Tcp, Tcp4, Tcp6, TcpError};
+use capsule::packets::{EnvelopeDiscardExt, Mbuf, Packet, Postmark};
 use capsule::runtime::{self, Runtime};
 use colored::Colorize;
 use signal_hook::consts;
 use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn dump_pkt(packet: Mbuf) -> Result<Postmark> {
-    let ethernet = e!(packet.parse::<Ethernet>());
+#[derive(Error, Debug)]
+enum PktDumpError {
+    #[error("ethernet packet error")]
+    EthernetError(#[from] EthernetError),
+    #[error("ip packet error")]
+    IpError(#[from] IpError),
+    #[error("tcp packet error")]
+    TcpError(#[from] TcpError),
+    #[error("not an Ipv4 or Ipv6 packet")]
+    UnsupportedPacketType(EtherType),
+}
+
+fn dump_pkt(packet: Mbuf) -> Result<Postmark, PktDumpError> {
+    let ethernet = packet.parse::<Ethernet>().discard()?;
 
     let fmt = format!("{:?}", ethernet).magenta().bold();
     info!("{}", fmt);
@@ -42,13 +53,13 @@ fn dump_pkt(packet: Mbuf) -> Result<Postmark> {
     match ethernet.ether_type() {
         EtherTypes::Ipv4 => dump_v4(&ethernet),
         EtherTypes::Ipv6 => dump_v6(&ethernet),
-        _ => Err(anyhow!("not v4 or v6.")),
+        type_ => Err(PktDumpError::UnsupportedPacketType(type_)),
     }?;
 
     Ok(Postmark::drop(ethernet))
 }
 
-fn dump_v4(ethernet: &Ethernet) -> Result<()> {
+fn dump_v4(ethernet: &Ethernet) -> Result<(), PktDumpError> {
     let v4 = ethernet.peek::<Ipv4>()?;
     let fmt = format!("{:?}", v4).yellow();
     info!("{}", fmt);
@@ -59,7 +70,7 @@ fn dump_v4(ethernet: &Ethernet) -> Result<()> {
     Ok(())
 }
 
-fn dump_v6(ethernet: &Ethernet) -> Result<()> {
+fn dump_v6(ethernet: &Ethernet) -> Result<(), PktDumpError> {
     let v6 = ethernet.peek::<Ipv6>()?;
     let fmt = format!("{:?}", v6).cyan();
     info!("{}", fmt);
@@ -78,7 +89,7 @@ fn dump_tcp<T: IpPacket>(tcp: &Tcp<T>) {
     info!("{}", fmt);
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::INFO)
         .finish();

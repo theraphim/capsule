@@ -28,13 +28,13 @@ pub use self::echo_request::*;
 pub use self::redirect::*;
 pub use self::time_exceeded::*;
 pub use capsule_macros::Icmpv4Packet;
+use std::error::Error;
 
 use crate::ensure;
-use crate::packets::ip::v4::Ipv4;
-use crate::packets::ip::ProtocolNumbers;
+use crate::packets::icmp::IcmpError;
+use crate::packets::ip::{v4::Ipv4, ProtocolNumbers};
 use crate::packets::types::u16be;
 use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -135,13 +135,21 @@ impl Icmpv4 {
     /// Returns an error if the message type in the packet header does not
     /// match the assigned message type for `T`.
     #[inline]
-    pub fn downcast<T: Icmpv4Message>(self) -> Result<T, (Error, Self)> {
+    pub fn downcast<T: Icmpv4Message>(self) -> Result<T, (T::Error, Self)> {
         ensure!(
             self.msg_type() == T::msg_type(),
-            (anyhow!("the ICMPv4 packet is not {}.", T::msg_type()), self)
+            (
+                IcmpError::IcmpTypeMismatch {
+                    packet_type: self.envelope.protocol(),
+                    found: self.msg_type().0,
+                    expected: T::msg_type().0
+                }
+                .into(),
+                self
+            )
         );
 
-        T::try_parse(self, Internal(()))
+        Ok(T::try_parse(self, Internal(()))?)
     }
 }
 
@@ -161,6 +169,7 @@ impl fmt::Debug for Icmpv4 {
 impl Packet for Icmpv4 {
     /// The preceding type for ICMPv4 packet must be IPv4.
     type Envelope = Ipv4;
+    type Error = IcmpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -202,17 +211,26 @@ impl Packet for Icmpv4 {
     /// [`Ipv4::protocol`]: crate::packets::ip::v4::Ipv4::protocol
     /// [`ProtocolNumbers::Icmpv4`]: crate::packets::ip::ProtocolNumbers::Icmpv4
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.protocol() == ProtocolNumbers::Icmpv4,
-            (anyhow!("not an ICMPv4 packet."), envelope)
+            (
+                IcmpError::InvalidPacketType {
+                    found: envelope.protocol(),
+                    expected: ProtocolNumbers::Icmpv4
+                },
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Icmpv4 {
@@ -228,10 +246,8 @@ impl Packet for Icmpv4 {
     ///
     /// [`EchoRequest`]: EchoRequest
     #[inline]
-    fn try_push(_envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
-        Err(anyhow!(
-            "cannot push a generic ICMPv4 header without a message body."
-        ))
+    fn try_push(_envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
+        Err(IcmpError::DisallowedPush)
     }
 
     #[inline]
@@ -339,6 +355,8 @@ pub struct Icmpv4Header {
 /// [`Packet`]: Packet
 /// [`Icmpv4Packet`]: Icmpv4Packet
 pub trait Icmpv4Message {
+    type Error: Error + From<IcmpError>;
+
     /// Returns the assigned message type.
     fn msg_type() -> Icmpv4Type;
 
@@ -371,7 +389,7 @@ pub trait Icmpv4Message {
     ///
     /// [`Icmpv4::downcast`]: Icmpv4::downcast
     /// [`msg_type`]: Icmpv4::msg_type
-    fn try_parse(icmp: Icmpv4, internal: Internal) -> Result<Self, (Error, Icmpv4)>
+    fn try_parse(icmp: Icmpv4, internal: Internal) -> Result<Self, (Self::Error, Icmpv4)>
     where
         Self: Sized;
 
@@ -389,7 +407,7 @@ pub trait Icmpv4Message {
     ///
     /// [`msg_type`]: Icmpv4::msg_type
     /// [`Packet::push`]: Packet::push
-    fn try_push(icmp: Icmpv4, internal: Internal) -> Result<Self>
+    fn try_push(icmp: Icmpv4, internal: Internal) -> Result<Self, Self::Error>
     where
         Self: Sized;
 

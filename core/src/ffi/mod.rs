@@ -20,9 +20,8 @@ pub(crate) mod dpdk;
 #[cfg(feature = "pcap-dump")]
 pub(crate) mod pcap;
 
+use crate::ffi::dpdk::DpdkError;
 use crate::warn;
-use anyhow::Result;
-use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::ops::{Deref, DerefMut};
 use std::os::raw;
@@ -89,10 +88,9 @@ impl ToCString for &str {
 pub(crate) trait ToResult {
     type Ok;
 
-    fn into_result<E, F>(self, f: F) -> Result<Self::Ok>
+    fn into_result<F>(self, f: F) -> Result<Self::Ok, DpdkError>
     where
-        E: Error + Send + Sync + 'static,
-        F: FnOnce(Self) -> E,
+        F: FnOnce(Self) -> DpdkError,
         Self: Sized;
 }
 
@@ -100,10 +98,9 @@ impl<T> ToResult for *mut T {
     type Ok = NonNull<T>;
 
     #[inline]
-    fn into_result<E, F>(self, f: F) -> Result<Self::Ok>
+    fn into_result<F>(self, f: F) -> Result<Self::Ok, DpdkError>
     where
-        E: Error + Send + Sync + 'static,
-        F: FnOnce(Self) -> E,
+        F: FnOnce(Self) -> DpdkError,
     {
         NonNull::new(self).ok_or_else(|| f(self).into())
     }
@@ -113,10 +110,9 @@ impl<T> ToResult for *const T {
     type Ok = *const T;
 
     #[inline]
-    fn into_result<E, F>(self, f: F) -> Result<Self::Ok>
+    fn into_result<F>(self, f: F) -> Result<Self::Ok, DpdkError>
     where
-        E: Error + Send + Sync + 'static,
-        F: FnOnce(Self) -> E,
+        F: FnOnce(Self) -> DpdkError,
     {
         if self.is_null() {
             Err(f(self).into())
@@ -130,10 +126,9 @@ impl ToResult for raw::c_int {
     type Ok = u32;
 
     #[inline]
-    fn into_result<E, F>(self, f: F) -> Result<Self::Ok>
+    fn into_result<F>(self, f: F) -> Result<Self::Ok, DpdkError>
     where
-        E: Error + Send + Sync + 'static,
-        F: FnOnce(Self) -> E,
+        F: FnOnce(Self) -> DpdkError,
     {
         if self >= 0 {
             Ok(self as u32)

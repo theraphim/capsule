@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 anyhow = "1.0"
+thiserror = "1.0.30"
 bimap = "0.6"
 capsule = { version = "0.2", path = "../../core" }
 colored = "2.0"

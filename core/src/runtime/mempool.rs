@@ -19,19 +19,28 @@
 use crate::ffi::dpdk::{self, LcoreId, MempoolPtr, SocketId};
 use crate::ffi::AsStr;
 use crate::{debug, info};
-use anyhow::Result;
+use capsule::ffi::dpdk::DpdkError;
+#[cfg(feature = "metrics")]
+use metrics::gauge;
 use std::cell::Cell;
 use std::fmt;
 use std::ptr::{self, NonNull};
 use thiserror::Error;
-#[cfg(feature = "metrics")]
-use metrics::{gauge};
 
 /// A memory pool is an allocator of message buffers, or `Mbuf`. For best
 /// performance, each socket should have a dedicated `Mempool`.
 pub struct Mempool {
     ptr: MempoolPtr,
     name: String,
+}
+
+/// The thread local mempool is not set.
+#[derive(Debug, Error)]
+pub enum MempoolError {
+    #[error("dpdk error")]
+    DpdkError(#[from] DpdkError),
+    #[error("thread local mempool pointer not set for {0:?}.")]
+    PtrUnset(LcoreId),
 }
 
 impl Mempool {
@@ -53,7 +62,7 @@ impl Mempool {
         capacity: usize,
         cache_size: usize,
         socket_id: SocketId,
-    ) -> Result<Self> {
+    ) -> Result<Self, MempoolError> {
         let name: String = name.into();
         let ptr = dpdk::pktmbuf_pool_create(&name, capacity, cache_size, socket_id)?;
 
@@ -103,12 +112,12 @@ impl Mempool {
     ///
     /// # Errors
     ///
-    /// Returns `MempoolPtrUnsetError` if the thread local pointer is not
+    /// Returns `MempoolError::PtrUnset` if the thread local pointer is not
     /// set. For example when invoked from a non-EAL thread.
-    pub(crate) fn thread_local_ptr() -> Result<MempoolPtr> {
+    pub(crate) fn thread_local_ptr() -> Result<MempoolPtr, MempoolError> {
         let ptr = MEMPOOL.with(|tls| tls.get());
         NonNull::new(ptr)
-            .ok_or_else(|| MempoolPtrUnsetError(LcoreId::current()).into())
+            .ok_or_else(|| MempoolError::PtrUnset(LcoreId::current()))
             .map(|ptr| ptr.into())
     }
 }
@@ -132,11 +141,6 @@ impl Drop for Mempool {
         info!(?name, "mempool freed.");
     }
 }
-
-/// The thread local mempool is not set.
-#[derive(Debug, Error)]
-#[error("thread local mempool pointer not set for {0:?}.")]
-pub(crate) struct MempoolPtrUnsetError(LcoreId);
 
 thread_local! {
     /// The `Mempool` assigned to the core when the core is initialized.

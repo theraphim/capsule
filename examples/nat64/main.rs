@@ -16,16 +16,14 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use anyhow::Result;
 use bimap::BiMap;
-use capsule::e;
 use capsule::net::MacAddr;
-use capsule::packets::ethernet::Ethernet;
+use capsule::packets::ethernet::{Ethernet, EthernetError};
 use capsule::packets::ip::v4::Ipv4;
 use capsule::packets::ip::v6::{Ipv6, Ipv6Packet};
-use capsule::packets::ip::ProtocolNumbers;
-use capsule::packets::tcp::{Tcp4, Tcp6};
-use capsule::packets::{Mbuf, Packet, Postmark};
+use capsule::packets::ip::{IpError, ProtocolNumbers};
+use capsule::packets::tcp::{Tcp4, Tcp6, TcpError};
+use capsule::packets::{EnvelopeDiscardExt, Mbuf, Packet, Postmark};
 use capsule::runtime::{self, Runtime};
 use colored::Colorize;
 use once_cell::sync::Lazy;
@@ -35,11 +33,22 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
 static PORTS: Lazy<Mutex<BiMap<(Ipv6Addr, u16), u16>>> = Lazy::new(|| Mutex::new(BiMap::new()));
 static MACS: Lazy<Mutex<HashMap<Ipv6Addr, MacAddr>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Error, Debug)]
+enum Nat4to6PacketError {
+    #[error("ethernet packet error")]
+    Ethernet(#[from] EthernetError),
+    #[error("ip packet error")]
+    Ip(#[from] IpError),
+    #[error("tcp packet error")]
+    Tcp(#[from] TcpError),
+}
 
 /// Maps the destination IPv6 address to its IPv4 counterpart by stripping
 /// off the 96-bit prefix.
@@ -66,12 +75,12 @@ fn get_v4_port(mac: MacAddr, ip: Ipv6Addr, port: u16) -> u16 {
     }
 }
 
-fn nat_6to4(packet: Mbuf) -> Result<Postmark> {
+fn nat_6to4(packet: Mbuf) -> Result<Postmark, Nat4to6PacketError> {
     const SRC_IP: Ipv4Addr = Ipv4Addr::new(10, 100, 1, 11);
     const DST_MAC: MacAddr = MacAddr::new(0x02, 0x00, 0x00, 0xff, 0xff, 0xff);
 
-    let ethernet = e!(packet.parse::<Ethernet>());
-    let v6 = e!(ethernet.parse::<Ipv6>());
+    let ethernet = packet.parse::<Ethernet>().discard()?;
+    let v6 = ethernet.parse::<Ipv6>().discard()?;
 
     if v6.next_header() == ProtocolNumbers::Tcp {
         let dscp = v6.dscp();
@@ -94,7 +103,7 @@ fn nat_6to4(packet: Mbuf) -> Result<Postmark> {
         v4.set_src(SRC_IP);
         v4.set_dst(dst_ip);
 
-        let mut tcp = e!(v4.parse::<Tcp4>());
+        let mut tcp = v4.parse::<Tcp4>().discard()?;
         let port = tcp.src_port();
         tcp.set_src_port(get_v4_port(src_mac, src_ip, port));
         tcp.reconcile_all();
@@ -135,9 +144,9 @@ fn get_v6_dst(port: u16) -> Option<(MacAddr, Ipv6Addr, u16)> {
         .and_then(|(ip, port)| MACS.lock().unwrap().get(ip).map(|mac| (*mac, *ip, *port)))
 }
 
-fn nat_4to6(packet: Mbuf) -> Result<Postmark> {
-    let ethernet = e!(packet.parse::<Ethernet>());
-    let v4 = e!(ethernet.parse::<Ipv4>());
+fn nat_4to6(packet: Mbuf) -> Result<Postmark, Nat4to6PacketError> {
+    let ethernet = packet.parse::<Ethernet>().discard()?;
+    let v4 = ethernet.parse::<Ipv4>().discard()?;
 
     if v4.protocol() == ProtocolNumbers::Tcp && v4.fragment_offset() == 0 && !v4.more_fragments() {
         let tcp = v4.peek::<Tcp4>()?;
@@ -161,7 +170,7 @@ fn nat_4to6(packet: Mbuf) -> Result<Postmark> {
             v6.set_src(src_ip);
             v6.set_dst(dst_ip);
 
-            let mut tcp = e!(v6.parse::<Tcp6>());
+            let mut tcp = v6.parse::<Tcp6>().discard()?;
             tcp.set_dst_port(port);
             tcp.reconcile_all();
 
@@ -179,7 +188,7 @@ fn nat_4to6(packet: Mbuf) -> Result<Postmark> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::INFO)
         .finish();

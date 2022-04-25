@@ -17,9 +17,9 @@
 */
 
 use crate::packets::icmp::v4::{Icmpv4, Icmpv4Message, Icmpv4Packet, Icmpv4Type, Icmpv4Types};
+use crate::packets::icmp::IcmpError;
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -118,7 +118,7 @@ impl EchoReply {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    pub fn set_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IcmpError> {
         let offset = self.data_offset();
         let len = data.len() as isize - self.data_len() as isize;
         self.icmp_mut().mbuf_mut().resize(offset, len)?;
@@ -143,6 +143,8 @@ impl fmt::Debug for EchoReply {
 }
 
 impl Icmpv4Message for EchoReply {
+    type Error = IcmpError;
+
     #[inline]
     fn msg_type() -> Icmpv4Type {
         Icmpv4Types::EchoReply
@@ -178,12 +180,12 @@ impl Icmpv4Message for EchoReply {
     /// Returns an error if the payload does not have sufficient data for
     /// the echo reply message body.
     #[inline]
-    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self, (Error, Icmpv4)> {
+    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self, (Self::Error, Icmpv4)> {
         let mbuf = icmp.mbuf();
         let offset = icmp.payload_offset();
         let body = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, icmp)),
-            Ok(body) => body
+            Err(e) => return Err((e.into(), icmp)),
+            Ok(body) => body,
         };
 
         Ok(EchoReply { icmp, body })
@@ -196,7 +198,7 @@ impl Icmpv4Message for EchoReply {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    fn try_push(mut icmp: Icmpv4, _internal: Internal) -> Result<Self> {
+    fn try_push(mut icmp: Icmpv4, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = icmp.payload_offset();
         let mbuf = icmp.mbuf_mut();
 

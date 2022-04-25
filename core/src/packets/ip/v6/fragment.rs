@@ -19,13 +19,14 @@
 use crate::ensure;
 use crate::packets::checksum::PseudoHeader;
 use crate::packets::ip::v6::Ipv6Packet;
-use crate::packets::ip::{IpPacket, ProtocolNumber, ProtocolNumbers};
+use crate::packets::ip::{IpPacket, IpProtocolSpecificError, ProtocolNumber, ProtocolNumbers};
 use crate::packets::types::{u16be, u32be};
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
+use capsule::packets::ip::IpError;
 use std::fmt;
 use std::net::IpAddr;
 use std::ptr::NonNull;
+use thiserror::Error;
 
 /// Masks
 const FRAG_OS: u16be = u16be(u16::to_be(!0b111));
@@ -75,6 +76,18 @@ pub struct Fragment<E: Ipv6Packet> {
     header: NonNull<FragmentHeader>,
     offset: usize,
 }
+
+#[derive(Error, Debug)]
+pub enum FragmentError {
+    /* #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("ip packet error")]
+    IpPacketError(#[from] IpError), */ // TODO req negative_impl
+    #[error("not an IPv6 fragment packet: {0:?}")]
+    InvalidPacketType(ProtocolNumber),
+}
+
+// impl IpPacketError for FragmentError {}
 
 impl<E: Ipv6Packet> Fragment<E> {
     #[inline]
@@ -143,6 +156,7 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
     /// The preceding type for an IPv6 fragment packet can be either an
     /// IPv6 packet or any possible IPv6 extension packets.
     type Envelope = E;
+    type Error = IpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -184,17 +198,26 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Frag`]: ProtocolNumbers::Ipv6Frag
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.next_header() == ProtocolNumbers::Ipv6Frag,
-            (anyhow!("not an IPv6 fragment packet."), envelope)
+            (
+                IpProtocolSpecificError::V6(
+                    FragmentError::InvalidPacketType(envelope.next_header()).into()
+                )
+                .into(),
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Fragment {
@@ -217,7 +240,7 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Frag`]: ProtocolNumbers::Ipv6Frag
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, IpError> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -238,6 +261,11 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
         Ok(packet)
     }
 
+    #[inline]
+    fn deparse(self) -> Self::Envelope {
+        self.envelope
+    }
+
     /// Removes IPv6 fragment packet from the message buffer.
     ///
     /// The envelope's [`next_header`] field is set to the value of the
@@ -250,18 +278,13 @@ impl<E: Ipv6Packet> Packet for Fragment<E> {
     ///
     /// [`next_header`]: Ipv6Packet::next_header
     #[inline]
-    fn remove(mut self) -> Result<Self::Envelope> {
+    fn remove(mut self) -> Result<Self::Envelope, IpError> {
         let offset = self.offset();
         let len = self.header_len();
         let next_header = self.next_header();
         self.mbuf_mut().shrink(offset, len)?;
         self.envelope_mut().set_next_header(next_header);
         Ok(self.envelope)
-    }
-
-    #[inline]
-    fn deparse(self) -> Self::Envelope {
-        self.envelope
     }
 }
 
@@ -282,7 +305,7 @@ impl<E: Ipv6Packet> IpPacket for Fragment<E> {
     }
 
     #[inline]
-    fn set_src(&mut self, src: IpAddr) -> Result<()> {
+    fn set_src(&mut self, src: IpAddr) -> Result<(), IpError> {
         self.envelope_mut().set_src(src)
     }
 
@@ -292,7 +315,7 @@ impl<E: Ipv6Packet> IpPacket for Fragment<E> {
     }
 
     #[inline]
-    fn set_dst(&mut self, dst: IpAddr) -> Result<()> {
+    fn set_dst(&mut self, dst: IpAddr) -> Result<(), IpError> {
         self.envelope_mut().set_dst(dst)
     }
 
@@ -302,7 +325,7 @@ impl<E: Ipv6Packet> IpPacket for Fragment<E> {
     }
 
     #[inline]
-    fn truncate(&mut self, mtu: usize) -> Result<()> {
+    fn truncate(&mut self, mtu: usize) -> Result<(), IpError> {
         self.envelope_mut().truncate(mtu)
     }
 }

@@ -16,14 +16,13 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use anyhow::Result;
-use capsule::e;
-use capsule::packets::ethernet::Ethernet;
+use capsule::packets::ethernet::{Ethernet, EthernetError};
 use capsule::packets::icmp::v6::Icmpv6;
+use capsule::packets::icmp::IcmpError;
 use capsule::packets::ip::v6::{Ipv6, Ipv6Packet};
-use capsule::packets::ip::ProtocolNumbers;
-use capsule::packets::udp::Udp6;
-use capsule::packets::{Mbuf, Packet, Postmark};
+use capsule::packets::ip::{IpError, ProtocolNumbers};
+use capsule::packets::udp::{Udp6, UdpError};
+use capsule::packets::{EnvelopeDiscardExt, Mbuf, Packet, Postmark};
 use capsule::runtime::{self, Runtime};
 use colored::Colorize;
 use signal_hook::consts;
@@ -31,21 +30,40 @@ use signal_hook::flag;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn route_pkt(packet: Mbuf) -> Result<Postmark> {
-    let ipv6 = e!(e!(packet.parse::<Ethernet>()).parse::<Ipv6>());
+#[derive(Error, Debug)]
+pub enum KniError {
+    #[error("ethernet packet error")]
+    EthernetError(#[from] EthernetError),
+    #[error("ip packet error")]
+    IpError(#[from] IpError),
+    #[error("icmp packet error")]
+    IcmpError(#[from] IcmpError),
+    #[error("udp packet error")]
+    UdpError(#[from] UdpError),
+    #[error("could not parse packet contents as utf8 string")]
+    ParseAsString(#[from] str::Utf8Error),
+}
+
+fn route_pkt(packet: Mbuf) -> Result<Postmark, KniError> {
+    let ipv6 = packet
+        .parse::<Ethernet>()
+        .discard()?
+        .parse::<Ipv6>()
+        .discard()?;
 
     match ipv6.next_header() {
         ProtocolNumbers::Icmpv6 => {
-            let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
+            let icmp = ipv6.parse::<Icmpv6<Ipv6>>().discard()?;
             let fmt = format!("to kni0: {}", icmp.msg_type()).cyan();
             info!("{}", fmt);
             Ok(Postmark::emit(icmp))
         }
         ProtocolNumbers::Udp => {
-            let udp = e!(ipv6.parse::<Udp6>());
+            let udp = ipv6.parse::<Udp6>().discard()?;
             let fmt = format!("you said: {}", str::from_utf8(udp.data())?).bright_blue();
             info!("{}", fmt);
             Ok(Postmark::drop(udp))
@@ -58,10 +76,10 @@ fn route_pkt(packet: Mbuf) -> Result<Postmark> {
     }
 }
 
-fn from_kni(packet: Mbuf) -> Result<Postmark> {
-    let ethernet = e!(packet.parse::<Ethernet>());
-    let ipv6 = e!(ethernet.parse::<Ipv6>());
-    let icmp = e!(ipv6.parse::<Icmpv6<Ipv6>>());
+fn from_kni(packet: Mbuf) -> Result<Postmark, KniError> {
+    let ethernet = packet.parse::<Ethernet>().discard()?;
+    let ipv6 = ethernet.parse::<Ipv6>().discard()?;
+    let icmp = ipv6.parse::<Icmpv6<Ipv6>>().discard()?;
 
     let fmt = format!("from kni0: {}", icmp.msg_type()).green();
     info!("{}", fmt);
@@ -69,7 +87,7 @@ fn from_kni(packet: Mbuf) -> Result<Postmark> {
     Ok(Postmark::emit(icmp))
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::INFO)
         .finish();

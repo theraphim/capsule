@@ -16,20 +16,32 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use crate::ffi::dpdk::{self, LcoreId, LcoreState, MempoolPtr};
-use crate::{info};
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
-use std::fmt;
-use thiserror::Error;
-use triggered::{Listener, Trigger, trigger};
+use crate::ffi::dpdk::{self, DpdkLcoreError, LcoreId, LcoreState, MempoolPtr};
+use crate::info;
 use crate::runtime::MEMPOOL;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::ops::DerefMut;
+use thiserror::Error;
+use triggered::{trigger, Listener, Trigger};
 
 /// An abstraction on top of a DPDK logical core.
 pub struct Lcore {
     id: LcoreId,
-    shutdown: (Trigger, Listener)
+    shutdown: (Trigger, Listener),
+}
+
+/// Lcore error.
+#[derive(Debug, Error)]
+pub enum LcoreError {
+    #[error("dpdk lcore error")]
+    DpdkLcoreError(#[from] DpdkLcoreError),
+    #[error("lcore {0} not found")]
+    NotFound(usize),
+    #[error("lcore {0:?} not ready")]
+    NotReady(LcoreId),
 }
 
 impl Lcore {
@@ -38,51 +50,40 @@ impl Lcore {
     /// # Errors
     ///
     /// Returns `Error` if the given lcore is not in the WAIT state
-    fn new(id: LcoreId) -> Result<Self> {
+    fn new(id: LcoreId) -> Result<Self, LcoreError> {
         match dpdk::eal_get_lcore_state(id) {
-            Ok(LcoreState::WAIT) =>
-                Ok(Lcore {
-                    id,
-                    shutdown: trigger()
-                }),
-            Err(e) => Err(e),
-            _ => {
-                Err(anyhow!("LCore not ready"))
-            }
+            Ok(LcoreState::WAIT) => Ok(Lcore {
+                id,
+                shutdown: trigger(),
+            }),
+            Err(e) => Err(e.into()),
+            _ => Err(LcoreError::NotReady(id)),
         }
     }
 
     /// Checks if the LCore is ready to have tasks executed on it
-    pub fn is_ready(&self) -> Result<bool> {
-        Ok(
-            match dpdk::eal_get_lcore_state(self.id())? {
-                LcoreState::WAIT => true,
-                _ => false,
-            }
-        )
+    pub fn is_ready(&self) -> Result<bool, LcoreError> {
+        Ok(matches!(
+            dpdk::eal_get_lcore_state(self.id())?,
+            LcoreState::WAIT
+        ))
     }
 
     /// Checks if the LCore is currently running
-    pub fn is_running(&self) -> Result<bool> {
-        Ok(
-            !self.shutdown.1.is_triggered() &&
-            match dpdk::eal_get_lcore_state(self.id())? {
-                LcoreState::RUNNING => true,
-                _ => false,
-            }
-        )
+    pub fn is_running(&self) -> Result<bool, LcoreError> {
+        Ok(!self.shutdown.1.is_triggered()
+            && matches!(dpdk::eal_get_lcore_state(self.id())?, LcoreState::RUNNING))
     }
 
     /// Sets the thread local mempool for this lcore
-    pub(crate) fn add_mempool(&self, mut mempool: MempoolPtr) -> Result<()> {
+    pub(crate) fn add_mempool(&self, mut mempool: MempoolPtr) -> Result<(), LcoreError> {
         if !self.is_ready()? {
-            return Err(anyhow!("Lcore not ready"));
+            return Err(LcoreError::NotReady(self.id));
         }
-        dpdk::eal_remote_launch(self.id(),
-                                move || {
-                                    MEMPOOL.with(|tls| tls.set(mempool.deref_mut()));
-                                    Ok(None)
-                                })?;
+        dpdk::eal_remote_launch(self.id(), move || -> Result<Option<i32>, Infallible> {
+            MEMPOOL.with(|tls| tls.set(mempool.deref_mut()));
+            Ok(None)
+        })?;
         dpdk::eal_wait_lcore(self.id())?;
         Ok(())
     }
@@ -97,20 +98,24 @@ impl Lcore {
     /// # Errors
     ///
     /// Returns `Error` if the lcore is not in the WAIT state
-    pub fn run_loop<F>(&self, looped_fn: F) -> Result<()> where F: Fn() -> () + Send + 'static {
+    pub fn run_loop<RunFn>(&self, looped_fn: RunFn) -> Result<(), LcoreError>
+    where
+        RunFn: Fn() -> () + Send + 'static,
+    {
         if !self.is_ready()? {
-            return Err(anyhow!("Lcore not ready. Perhaps you forgot to `join` the last execution?"));
+            return Err(LcoreError::NotReady(self.id));
         }
         let listener = self.shutdown.1.clone();
         let id = self.id().clone();
-        dpdk::eal_remote_launch(self.id(), move || {
+        dpdk::eal_remote_launch(self.id(), move || -> Result<Option<i32>, Infallible> {
             info!(?id, "lcore function started.");
             while !listener.is_triggered() {
                 looped_fn();
             }
             info!(?id, "lcore function stopped.");
             Ok(None)
-        })
+        })?;
+        Ok(())
     }
 
     /// Spawns a function to be run once on this lcore
@@ -118,24 +123,29 @@ impl Lcore {
     /// # Errors
     ///
     /// Returns `Error` if the lcore is not in the WAIT state
-    pub fn run_single<F>(&self, run_fn: F) -> Result<()> where F: FnOnce(Listener) -> Result<Option<i32>> + Send + 'static {
+    pub fn run_single<RunFn, RunFnError>(&self, run_fn: RunFn) -> Result<(), LcoreError>
+    where
+        RunFnError: Error,
+        RunFn: FnOnce(Listener) -> Result<Option<i32>, RunFnError> + Send + 'static,
+    {
         if !self.is_ready()? {
-            return Err(anyhow!("Lcore not ready"));
+            return Err(LcoreError::NotReady(self.id));
         }
         let id = self.id().clone();
         let listener = self.shutdown.1.clone();
-        dpdk::eal_remote_launch(self.id(), move || {
+        dpdk::eal_remote_launch(self.id(), move || -> Result<Option<i32>, RunFnError> {
             info!(?id, "lcore function started.");
             let result = run_fn(listener);
             info!(?id, "lcore function stopped.");
             result
-        })
+        })?;
+        Ok(())
     }
 
     /// Shuts down the current task and returns the result
-    pub fn join(&mut self) -> Result<Option<i32>> {
+    pub fn join(&mut self) -> Result<Option<i32>, LcoreError> {
         self.shutdown.0.trigger();
-        dpdk::eal_wait_lcore(self.id())
+        Ok(dpdk::eal_wait_lcore(self.id())?)
     }
 }
 
@@ -151,19 +161,14 @@ impl Drop for Lcore {
     }
 }
 
-/// Lcore not found error.
-#[derive(Debug, Error)]
-#[error("lcore not found.")]
-pub struct LcoreNotFound;
-
 /// Map to lookup the lcore by the assigned id.
 #[derive(Debug)]
 pub struct LcoreMap(HashMap<usize, Lcore>);
 
 impl LcoreMap {
     /// Returns the lcore with the assigned id.
-    pub fn get(&self, id: usize) -> Result<&Lcore> {
-        self.0.get(&id).ok_or_else(|| LcoreNotFound.into())
+    pub fn get(&self, id: usize) -> Result<&Lcore, LcoreError> {
+        self.0.get(&id).ok_or_else(|| LcoreError::NotFound(id))
     }
 
     /// Returns a lcore iterator.
@@ -198,18 +203,26 @@ pub(crate) fn lcore_pool() -> LcoreMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::convert::TryInto;
+    use std::thread;
 
     #[capsule::test]
     fn get_current_lcore_id_from_eal() {
         let next_id = dpdk::get_next_lcore(None, true, false).expect("panic!");
         let mut lcore = Lcore::new(next_id).expect("panic!");
-        lcore.run_single(|_| {
-            let id: u32 = LcoreId::current().into();
-            Ok(Some(id.try_into()?))
-        }).unwrap();
-        let id: u32 = lcore.join().unwrap().ok_or(anyhow!("No result")).unwrap().try_into().unwrap();
+        lcore
+            .run_single(|_| {
+                let id: u32 = LcoreId::current().into();
+                Ok(Some(id.try_into()?))
+            })
+            .unwrap();
+        let id: u32 = lcore
+            .join()
+            .unwrap()
+            .ok_or(anyhow!("No result"))
+            .unwrap()
+            .try_into()
+            .unwrap();
         let lcore_id: LcoreId = id.into();
         assert_eq!(next_id, lcore_id);
     }

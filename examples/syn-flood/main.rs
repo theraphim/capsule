@@ -16,11 +16,11 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use anyhow::Result;
 use capsule::net::MacAddr;
-use capsule::packets::ethernet::Ethernet;
+use capsule::packets::ethernet::{Ethernet, EthernetError};
 use capsule::packets::ip::v4::Ipv4;
-use capsule::packets::tcp::Tcp4;
+use capsule::packets::ip::IpError;
+use capsule::packets::tcp::{Tcp4, TcpError};
 use capsule::packets::{Mbuf, Packet};
 use capsule::runtime::{self, Runtime};
 use signal_hook::consts;
@@ -29,10 +29,21 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn syn_flood(mbuf: Mbuf, src_mac: MacAddr) -> Result<Mbuf> {
+#[derive(Error, Debug)]
+enum SynFloodCreationError {
+    #[error("Failed to create ethernet packet")]
+    Ethernet(#[from] EthernetError),
+    #[error("Failed to create IPv4 packet")]
+    Ipv4(#[from] IpError),
+    #[error("Failed to create TCP packet")]
+    Tcp(#[from] TcpError),
+}
+
+fn syn_flood(mbuf: Mbuf, src_mac: MacAddr) -> Result<Mbuf, SynFloodCreationError> {
     let dst_ip = Ipv4Addr::new(10, 100, 1, 254);
     let dst_mac = MacAddr::new(0x02, 0x00, 0x00, 0xff, 0xff, 0xff);
 
@@ -54,7 +65,7 @@ fn syn_flood(mbuf: Mbuf, src_mac: MacAddr) -> Result<Mbuf> {
     Ok(tcp.reset())
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
@@ -68,13 +79,13 @@ fn main() -> Result<()> {
     let cap0 = runtime.ports().get("cap0")?;
     let src_mac = cap0.mac_addr();
 
-    cap0.spawn_tx_pipeline(runtime.lcores(),
-                           128,
-                           Some(Duration::from_millis(50)),
-                           move |mbuf, ()| {
-                               syn_flood(mbuf, src_mac.clone())
-                           },
-        || {()})?;
+    cap0.spawn_tx_pipeline(
+        runtime.lcores(),
+        128,
+        Some(Duration::from_millis(50)),
+        move |mbuf, ()| syn_flood(mbuf, src_mac),
+        || (),
+    )?;
 
     let _guard = runtime.execute()?;
 

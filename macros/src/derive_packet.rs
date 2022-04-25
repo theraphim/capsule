@@ -47,6 +47,7 @@ pub fn gen_icmpv6(input: syn::DeriveInput) -> TokenStream {
 
         impl<E: ::capsule::packets::ip::v6::Ipv6Packet> ::capsule::packets::Packet for #name<E> {
             type Envelope = E;
+            type Error = ::capsule::packets::icmp::IcmpError;
 
             #[inline]
             fn envelope(&self) -> &Self::Envelope {
@@ -74,12 +75,12 @@ pub fn gen_icmpv6(input: syn::DeriveInput) -> TokenStream {
             }
 
             #[inline]
-            fn try_parse(envelope: Self::Envelope, _internal: Internal) -> ::anyhow::Result<Self, (Error, Self::Envelope)> {
+            fn try_parse(envelope: Self::Envelope, _internal: Internal) -> ::std::result::Result<Self, (Self::Error, Self::Envelope)> {
                 envelope.parse::<::capsule::packets::icmp::v6::Icmpv6<E>>()?.downcast::<#name<E>>().map_err(|(e, env)| (e, env.deparse()))
             }
 
             #[inline]
-            fn try_push(mut envelope: Self::Envelope, internal: Internal) -> ::anyhow::Result<Self> {
+            fn try_push(mut envelope: Self::Envelope, internal: Internal) -> ::std::result::Result<Self, Self::Error> {
                 use ::capsule::packets::icmp::v6::{Icmpv6, Icmpv6Header, Icmpv6Message};
                 use ::capsule::packets::ip::{IpPacket, ProtocolNumbers};
                 use ::capsule::packets::SizeOf;
@@ -146,6 +147,7 @@ pub fn gen_icmpv4(input: syn::DeriveInput) -> TokenStream {
 
         impl ::capsule::packets::Packet for #name {
             type Envelope = ::capsule::packets::ip::v4::Ipv4;
+            type Error = ::capsule::packets::icmp::IcmpError;
 
             #[inline]
             fn envelope(&self) -> &Self::Envelope {
@@ -173,12 +175,12 @@ pub fn gen_icmpv4(input: syn::DeriveInput) -> TokenStream {
             }
 
             #[inline]
-            fn try_parse(envelope: Self::Envelope, _internal: ::capsule::packets::Internal) -> ::anyhow::Result<Self, (Error, Self::Envelope)> {
+            fn try_parse(envelope: Self::Envelope, _internal: ::capsule::packets::Internal) -> ::std::result::Result<Self, (Self::Error, Self::Envelope)> {
                 envelope.parse::<::capsule::packets::icmp::v4::Icmpv4>()?.downcast::<#name>().map_err(|(e, env)| (e, env.deparse()))
             }
 
             #[inline]
-            fn try_push(mut envelope: Self::Envelope, internal: ::capsule::packets::Internal) -> ::anyhow::Result<Self> {
+            fn try_push(mut envelope: Self::Envelope, internal: ::capsule::packets::Internal) -> ::std::result::Result<Self, Self::Error> {
                 use ::capsule::packets::icmp::v4::{Icmpv4, Icmpv4Header, Icmpv4Message};
                 use ::capsule::packets::ip::{IpPacket, ProtocolNumbers};
                 use ::capsule::packets::SizeOf;

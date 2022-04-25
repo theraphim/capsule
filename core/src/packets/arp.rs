@@ -20,13 +20,13 @@
 
 use crate::ensure;
 use crate::net::MacAddr;
-use crate::packets::ethernet::{EtherTypes, Ethernet};
+use crate::packets::ethernet::{EtherType, EtherTypes, Ethernet};
 use crate::packets::types::u16be;
-use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
+use crate::packets::{Internal, MbufError, Packet, SizeOf};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::ptr::NonNull;
+use thiserror::Error;
 
 /// Address Resolution Protocol packet based on [IETF RFC 826].
 ///
@@ -241,9 +241,33 @@ impl<H: HardwareAddr, P: ProtocolAddr> fmt::Debug for Arp<H, P> {
     }
 }
 
+/// ARP packet error
+#[derive(Error, Debug)]
+pub enum ArpError {
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("not an arp packet: {0}")]
+    InvalidPacketType(EtherType),
+    #[error("hardware type {found:?} does not match expected {expected:?}")]
+    HardwareTypeMismatch {
+        found: HardwareType,
+        expected: HardwareType,
+    },
+    #[error("protocol type {found:?} does not match expected {expected:?}")]
+    ProtocolTypeMismatch {
+        found: ProtocolType,
+        expected: ProtocolType,
+    },
+    #[error("hardware address length {found:?} does not match expected {expected:?}")]
+    HardwareAddrLenMismatch { found: u8, expected: u8 },
+    #[error("protocol address length {found:?} does not match expected {expected:?}")]
+    ProtocolAddrLenMismatch { found: u8, expected: u8 },
+}
+
 impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
     /// The preceding type for ARP must be `Ethernet`.
     type Envelope = Ethernet;
+    type Error = ArpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -290,17 +314,20 @@ impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Arp`]: EtherTypes::Arp
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.ether_type() == EtherTypes::Arp,
-            (anyhow!("not an ARP packet."), envelope)
+            (ArpError::InvalidPacketType(envelope.ether_type()), envelope)
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         let packet = Arp {
@@ -311,35 +338,43 @@ impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
 
         ensure!(
             packet.hardware_type() == H::addr_type(),
-            (anyhow!(
-                "hardware type {} does not match expected {}.",
-                packet.hardware_type(),
-                H::addr_type(),
-            ), packet.deparse())
+            (
+                ArpError::HardwareTypeMismatch {
+                    found: packet.hardware_type(),
+                    expected: H::addr_type(),
+                },
+                packet.deparse()
+            )
         );
         ensure!(
             packet.protocol_type() == P::addr_type(),
-            (anyhow!(
-                "protocol type {} does not match expected {}.",
-                packet.protocol_type(),
-                P::addr_type()
-            ), packet.deparse())
+            (
+                ArpError::ProtocolTypeMismatch {
+                    found: packet.protocol_type(),
+                    expected: P::addr_type(),
+                },
+                packet.deparse()
+            )
         );
         ensure!(
             packet.hardware_addr_len() == H::size_of() as u8,
-            (anyhow!(
-                "hardware address length {} does not match expected {}.",
-                packet.hardware_addr_len(),
-                H::size_of()
-            ), packet.deparse())
+            (
+                ArpError::HardwareAddrLenMismatch {
+                    found: packet.hardware_addr_len(),
+                    expected: H::size_of() as u8,
+                },
+                packet.deparse()
+            )
         );
         ensure!(
             packet.protocol_addr_len() == P::size_of() as u8,
-            (anyhow!(
-                "protocol address length {} does not match expected {}.",
-                packet.protocol_addr_len(),
-                P::size_of()
-            ), packet.deparse())
+            (
+                ArpError::ProtocolAddrLenMismatch {
+                    found: packet.protocol_addr_len(),
+                    expected: P::size_of() as u8,
+                },
+                packet.deparse()
+            )
         );
 
         Ok(packet)
@@ -358,7 +393,7 @@ impl<H: HardwareAddr, P: ProtocolAddr> Packet for Arp<H, P> {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Arp`]: EtherTypes::Arp
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 

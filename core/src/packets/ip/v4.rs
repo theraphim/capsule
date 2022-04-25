@@ -21,10 +21,9 @@
 use crate::ensure;
 use crate::packets::checksum::{self, PseudoHeader};
 use crate::packets::ethernet::{EtherTypes, Ethernet};
-use crate::packets::ip::{IpPacket, ProtocolNumber, DEFAULT_IP_TTL};
+use crate::packets::ip::{IpError, IpPacket, IpVersion, ProtocolNumber, DEFAULT_IP_TTL};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::ptr::NonNull;
@@ -358,7 +357,7 @@ impl Ipv4 {
     }
 
     /// Swaps the source and destination addresses
-    fn swap_addresses(&mut self) {
+    pub fn swap_addresses(&mut self) {
         let src_addr = self.src();
         self.set_src(self.dst());
         self.set_dst(src_addr)
@@ -391,6 +390,7 @@ impl fmt::Debug for Ipv4 {
 impl Packet for Ipv4 {
     /// The preceding type for an IPv4 packet must be Ethernet.
     type Envelope = Ethernet;
+    type Error = IpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -432,17 +432,26 @@ impl Packet for Ipv4 {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Ipv4`]: EtherTypes::Ipv4
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.ether_type() == EtherTypes::Ipv4,
-            (anyhow!("not an IPv4 packet."), envelope)
+            (
+                IpError::InvalidPacketType {
+                    found: envelope.ether_type(),
+                    expected: EtherTypes::Ipv4
+                },
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Ipv4 {
@@ -463,7 +472,7 @@ impl Packet for Ipv4 {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Ipv4`]: EtherTypes::Ipv4
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -522,13 +531,15 @@ impl IpPacket for Ipv4 {
     ///
     /// Returns an error if `src` is not an Ipv4Addr.
     #[inline]
-    fn set_src(&mut self, src: IpAddr) -> Result<()> {
+    fn set_src(&mut self, src: IpAddr) -> Result<(), IpError> {
         match src {
             IpAddr::V4(addr) => {
                 self.set_src(addr);
                 Ok(())
             }
-            _ => Err(anyhow!("source address must be IPv4.")),
+            _ => Err(IpError::InvalidSourceAddress {
+                expected: IpVersion::IPv4,
+            }),
         }
     }
 
@@ -543,13 +554,15 @@ impl IpPacket for Ipv4 {
     ///
     /// Returns an error if `dst` is not an Ipv4Addr.
     #[inline]
-    fn set_dst(&mut self, dst: IpAddr) -> Result<()> {
+    fn set_dst(&mut self, dst: IpAddr) -> Result<(), IpError> {
         match dst {
             IpAddr::V4(addr) => {
                 self.set_dst(addr);
                 Ok(())
             }
-            _ => Err(anyhow!("destination address must be IPv4.")),
+            _ => Err(IpError::InvalidDestinationAddress {
+                expected: IpVersion::IPv4,
+            }),
         }
     }
 
@@ -571,15 +584,19 @@ impl IpPacket for Ipv4 {
     ///
     /// [`IPV4_MIN_MTU`]: IPV4_MIN_MTU
     #[inline]
-    fn truncate(&mut self, mtu: usize) -> Result<()> {
+    fn truncate(&mut self, mtu: usize) -> Result<(), IpError> {
         ensure!(
             mtu >= IPV4_MIN_MTU,
-            anyhow!("MTU {} must be greater than {}.", mtu, IPV4_MIN_MTU)
+            IpError::InvalidMtu {
+                found: mtu,
+                expected: IPV4_MIN_MTU
+            }
         );
 
         // accounts for the Ethernet frame length.
         let to_len = mtu + self.offset();
-        self.mbuf_mut().truncate(to_len)
+        self.mbuf_mut().truncate(to_len)?;
+        Ok(())
     }
 }
 

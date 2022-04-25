@@ -32,8 +32,8 @@ pub mod udp;
 pub use self::mbuf::*;
 pub use self::size_of::*;
 pub use capsule_macros::SizeOf;
+use std::error::Error;
 
-use anyhow::{Context, Result, Error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -51,26 +51,33 @@ use std::ops::Deref;
 #[derive(Clone, Debug)]
 pub struct Internal(());
 
-/// A macro to return from the current function with the actual error from a
-/// `Result<T, (Error, T::Envelope)>` commonly found in `packet.parse<T>()`
-///
-/// # Example
-///
-/// ```
-/// fn to_ipv4(packet: Mbuf) -> Result<Ipv4> {
-///     packet.parse::<Ethernet>().e().parse::<Ipv4>().e()
-/// }
-/// ```
-#[macro_export]
-macro_rules! e {
-    ($expr:expr $(,)?) => {
-        match $expr {
-            anyhow::Result::Ok(val) => val,
-            anyhow::Result::Err((err, _)) => {
-                return anyhow::Result::Err(err);
-            }
-        }
-    };
+/// Trait containing the `discard` function
+pub trait EnvelopeDiscardExt<OkType, ErrorType>
+where
+    ErrorType: Error,
+{
+    /// Transforms a `Result<T, (Error, T::Envelope)>` commonly found in `packet.parse<T>()`
+    /// into an `Result<T, Error>`, discarding the returned packet ownership.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// fn to_ipv4(packet: Mbuf) -> Result<Ipv4> {
+    ///     packet.parse::<Ethernet>().discard()?.parse::<Ipv4>().discard()
+    /// }
+    /// ```
+    fn discard(self) -> Result<OkType, ErrorType>;
+}
+
+impl<OkType, ErrorType, EnvelopeType> EnvelopeDiscardExt<OkType, ErrorType>
+    for Result<OkType, (ErrorType, EnvelopeType)>
+where
+    ErrorType: Error,
+    EnvelopeType: Packet,
+{
+    fn discard(self) -> Result<OkType, ErrorType> {
+        self.map_err(|(err, _)| err)
+    }
 }
 
 /// A trait all network protocols must implement.
@@ -101,6 +108,9 @@ pub trait Packet {
     /// [Ethernet]: Ethernet
     /// [IPv4]: ip::v4::Ipv4
     type Envelope: Packet;
+
+    /// The error type used for functions of this trait, needs to implement From<MbufError>
+    type Error: Error + From<MbufError>;
 
     /// Returns a reference to the envelope.
     fn envelope(&self) -> &Self::Envelope;
@@ -187,7 +197,10 @@ pub trait Packet {
     /// [IPv4]: ip::v4::Ipv4
     /// [`ether_type`]: Ethernet::ether_type
     /// [`parse`]: Packet::parse
-    fn try_parse(envelope: Self::Envelope, internal: Internal) -> Result<Self, (Error, Self::Envelope)>
+    fn try_parse(
+        envelope: Self::Envelope,
+        internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)>
     where
         Self: Sized;
 
@@ -198,7 +211,7 @@ pub trait Packet {
     ///
     /// [`peek`]: Packet::peek
     #[inline]
-    fn parse<T: Packet<Envelope = Self>>(self) -> Result<T, (Error, Self)>
+    fn parse<T: Packet<Envelope = Self>>(self) -> Result<T, (T::Error, Self)>
     where
         Self: Sized,
     {
@@ -210,7 +223,7 @@ pub trait Packet {
     /// `peek` returns an immutable reference to the payload. The caller
     /// retains full ownership of the packet.
     #[inline]
-    fn peek<T: Packet<Envelope = Self>>(&self) -> Result<Immutable<'_, T>>
+    fn peek<T: Packet<Envelope = Self>>(&self) -> Result<Immutable<'_, T>, T::Error>
     where
         Self: Sized,
     {
@@ -231,14 +244,14 @@ pub trait Packet {
     /// [`push`].
     ///
     /// [`push`]: Packet::push
-    fn try_push(envelope: Self::Envelope, internal: Internal) -> Result<Self>
+    fn try_push(envelope: Self::Envelope, internal: Internal) -> Result<Self, Self::Error>
     where
         Self: Sized;
 
     /// Prepends a new packet of type `T` to the beginning of the envelope's
     /// payload.
     #[inline]
-    fn push<T: Packet<Envelope = Self>>(self) -> Result<T>
+    fn push<T: Packet<Envelope = Self>>(self) -> Result<T, T::Error>
     where
         Self: Sized,
     {
@@ -262,15 +275,13 @@ pub trait Packet {
     /// Returns an error if the buffer does not have sufficient data to
     /// remove.
     #[inline]
-    fn remove(mut self) -> Result<Self::Envelope>
+    fn remove(mut self) -> Result<Self::Envelope, Self::Error>
     where
         Self: Sized,
     {
         let offset = self.offset();
         let len = self.header_len();
-        self.mbuf_mut()
-            .shrink(offset, len)
-            .context("failed to remove packet header.")?;
+        self.mbuf_mut().shrink(offset, len)?;
         Ok(self.deparse())
     }
 
@@ -281,12 +292,10 @@ pub trait Packet {
     /// Returns an error if the size of the payload to remove exceeds data
     /// stored in the buffer. The packet in the mbuf is invalid.
     #[inline]
-    fn remove_payload(&mut self) -> Result<()> {
+    fn remove_payload(&mut self) -> Result<(), Self::Error> {
         let offset = self.payload_offset();
         let len = self.payload_len();
-        self.mbuf_mut()
-            .shrink(offset, len)
-            .context("failed to remove packet payload.")?;
+        self.mbuf_mut().shrink(offset, len)?;
         Ok(())
     }
 
@@ -375,10 +384,7 @@ pub struct Postmark {
 impl Postmark {
     /// Emit multiple packets
     pub fn emit_multi(emit: Vec<Mbuf>) -> Postmark {
-        Postmark {
-            emit,
-            drop: None
-        }
+        Postmark { emit, drop: None }
     }
 
     /// Emit a single packet
@@ -390,7 +396,7 @@ impl Postmark {
     pub fn drop<D: Packet>(drop: D) -> Postmark {
         Postmark {
             emit: vec![],
-            drop: Some(drop.reset())
+            drop: Some(drop.reset()),
         }
     }
 

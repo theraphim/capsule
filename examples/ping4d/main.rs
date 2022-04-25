@@ -16,20 +16,34 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use anyhow::Result;
-use capsule::packets::ethernet::Ethernet;
+use capsule::packets::ethernet::{Ethernet, EthernetError};
 use capsule::packets::icmp::v4::{EchoReply, EchoRequest};
+use capsule::packets::icmp::IcmpError;
 use capsule::packets::ip::v4::Ipv4;
-use capsule::packets::{Mbuf, Packet, Postmark};
+use capsule::packets::ip::IpError;
+use capsule::packets::{Mbuf, MbufError, Packet, Postmark};
 use capsule::runtime::{self, Runtime};
 use signal_hook::consts;
 use signal_hook::flag;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
-fn reply_echo(packet: Mbuf) -> Result<Postmark> {
+#[derive(Error, Debug)]
+enum Ping4dError {
+    #[error("Failed to create mbuf for reply")]
+    MbufCreationFailed(#[from] MbufError),
+    #[error("ethernet packet error")]
+    EthernetError(#[from] EthernetError),
+    #[error("ip packet error")]
+    IpError(#[from] IpError),
+    #[error("icmp packet error")]
+    IcmpError(#[from] IcmpError),
+}
+
+fn reply_echo(packet: Mbuf) -> Result<Postmark, Ping4dError> {
     let reply = Mbuf::new()?;
 
     let ethernet = packet.peek::<Ethernet>()?;
@@ -56,7 +70,7 @@ fn reply_echo(packet: Mbuf) -> Result<Postmark> {
     Ok(Postmark::emit_and_drop(reply, packet))
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
@@ -65,13 +79,12 @@ fn main() -> Result<()> {
     let config = runtime::load_config()?;
     let runtime = Runtime::from_config(config)?;
 
-    runtime.ports()
-        .get("cap0")?
-        .spawn_rx_tx_pipeline(
-            runtime.lcores(),
-            |mbuf, _| reply_echo(mbuf),
-            || (),
-            None)?;
+    runtime.ports().get("cap0")?.spawn_rx_tx_pipeline(
+        runtime.lcores(),
+        |mbuf, _| reply_echo(mbuf),
+        || (),
+        None,
+    )?;
 
     let _guard = runtime.execute()?;
 

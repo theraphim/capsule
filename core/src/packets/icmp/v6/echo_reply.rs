@@ -17,10 +17,10 @@
 */
 
 use crate::packets::icmp::v6::{Icmpv6, Icmpv6Message, Icmpv6Packet, Icmpv6Type, Icmpv6Types};
+use crate::packets::icmp::IcmpError;
 use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -119,7 +119,7 @@ impl<E: Ipv6Packet> EchoReply<E> {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    pub fn set_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IcmpError> {
         let offset = self.data_offset();
         let len = data.len() as isize - self.data_len() as isize;
         self.icmp_mut().mbuf_mut().resize(offset, len)?;
@@ -145,6 +145,7 @@ impl<E: Ipv6Packet> fmt::Debug for EchoReply<E> {
 
 impl<E: Ipv6Packet> Icmpv6Message for EchoReply<E> {
     type Envelope = E;
+    type Error = IcmpError;
 
     #[inline]
     fn msg_type() -> Icmpv6Type {
@@ -181,12 +182,15 @@ impl<E: Ipv6Packet> Icmpv6Message for EchoReply<E> {
     /// Returns an error if the payload does not have sufficient data for
     /// the echo reply message body.
     #[inline]
-    fn try_parse(icmp: Icmpv6<Self::Envelope>, _internal: Internal) -> Result<Self, (Error, Icmpv6<Self::Envelope>)> {
+    fn try_parse(
+        icmp: Icmpv6<Self::Envelope>,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Icmpv6<Self::Envelope>)> {
         let mbuf = icmp.mbuf();
         let offset = icmp.payload_offset();
         let body = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, icmp)),
-            Ok(body) => body
+            Err(e) => return Err((e.into(), icmp)),
+            Ok(body) => body,
         };
 
         Ok(EchoReply { icmp, body })
@@ -199,7 +203,10 @@ impl<E: Ipv6Packet> Icmpv6Message for EchoReply<E> {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    fn try_push(mut icmp: Icmpv6<Self::Envelope>, _internal: Internal) -> Result<Self> {
+    fn try_push(
+        mut icmp: Icmpv6<Self::Envelope>,
+        _internal: Internal,
+    ) -> Result<Self, Self::Error> {
         let offset = icmp.payload_offset();
         let mbuf = icmp.mbuf_mut();
 

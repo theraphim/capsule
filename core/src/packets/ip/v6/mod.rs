@@ -27,13 +27,13 @@ pub use self::srh::*;
 use crate::ensure;
 use crate::packets::checksum::PseudoHeader;
 use crate::packets::ethernet::{EtherTypes, Ethernet};
-use crate::packets::ip::{IpPacket, ProtocolNumber, DEFAULT_IP_TTL};
+use crate::packets::ip::{IpError, IpPacket, IpVersion, ProtocolNumber, DEFAULT_IP_TTL};
 use crate::packets::types::{u16be, u32be};
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ptr::NonNull;
+use thiserror::Error;
 
 /// The minimum IPv6 MTU defined in [IETF RFC 2460].
 ///
@@ -100,6 +100,14 @@ pub struct Ipv6 {
     envelope: Ethernet,
     header: NonNull<Ipv6Header>,
     offset: usize,
+}
+
+#[derive(Error, Debug)]
+pub enum Ipv6Error {
+    #[error("Fragment error")]
+    Fragment(#[from] FragmentError),
+    #[error("Segment routing error")]
+    SegmentRouting(#[from] SegmentRoutingError),
 }
 
 impl Ipv6 {
@@ -238,6 +246,7 @@ impl fmt::Debug for Ipv6 {
 impl Packet for Ipv6 {
     /// The preceding type for IPv6 packet must be Ethernet.
     type Envelope = Ethernet;
+    type Error = IpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -279,17 +288,26 @@ impl Packet for Ipv6 {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Ipv6`]: EtherTypes::Ipv6
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.ether_type() == EtherTypes::Ipv6,
-            (anyhow!("not an IPv6 packet."), envelope)
+            (
+                IpError::InvalidPacketType {
+                    found: envelope.ether_type(),
+                    expected: EtherTypes::Ipv6
+                },
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Ipv6 {
@@ -310,7 +328,7 @@ impl Packet for Ipv6 {
     /// [`ether_type`]: Ethernet::ether_type
     /// [`EtherTypes::Ipv6`]: EtherTypes::Ipv6
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -367,13 +385,15 @@ impl IpPacket for Ipv6 {
     ///
     /// Returns an error if `src` is not an Ipv6Addr.
     #[inline]
-    fn set_src(&mut self, src: IpAddr) -> Result<()> {
+    fn set_src(&mut self, src: IpAddr) -> Result<(), IpError> {
         match src {
             IpAddr::V6(addr) => {
                 self.set_src(addr);
                 Ok(())
             }
-            _ => Err(anyhow!("source address must be IPv6.")),
+            _ => Err(IpError::InvalidSourceAddress {
+                expected: IpVersion::IPv6,
+            }),
         }
     }
 
@@ -388,13 +408,15 @@ impl IpPacket for Ipv6 {
     ///
     /// Returns an error if `dst` is not an Ipv6Addr.
     #[inline]
-    fn set_dst(&mut self, dst: IpAddr) -> Result<()> {
+    fn set_dst(&mut self, dst: IpAddr) -> Result<(), IpError> {
         match dst {
             IpAddr::V6(addr) => {
                 self.set_dst(addr);
                 Ok(())
             }
-            _ => Err(anyhow!("destination address must be IPv6.")),
+            _ => Err(IpError::InvalidDestinationAddress {
+                expected: IpVersion::IPv6,
+            }),
         }
     }
 
@@ -416,15 +438,19 @@ impl IpPacket for Ipv6 {
     ///
     /// [`IPV6_MIN_MTU`]: IPV6_MIN_MTU
     #[inline]
-    fn truncate(&mut self, mtu: usize) -> Result<()> {
+    fn truncate(&mut self, mtu: usize) -> Result<(), IpError> {
         ensure!(
             mtu >= IPV6_MIN_MTU,
-            anyhow!("MTU {} must be greater than {}.", mtu, IPV6_MIN_MTU)
+            IpError::InvalidMtu {
+                found: mtu,
+                expected: IPV6_MIN_MTU
+            }
         );
 
         // accounts for the Ethernet frame length.
         let to_len = mtu + self.offset();
-        self.mbuf_mut().truncate(to_len)
+        self.mbuf_mut().truncate(to_len)?;
+        Ok(())
     }
 }
 

@@ -31,13 +31,14 @@ pub use self::time_exceeded::*;
 pub use self::too_big::*;
 pub use self::unreachable::*;
 pub use capsule_macros::Icmpv6Packet;
+use std::error::Error;
 
 use crate::ensure;
+use crate::packets::icmp::IcmpError;
 use crate::packets::ip::v6::Ipv6Packet;
 use crate::packets::ip::ProtocolNumbers;
 use crate::packets::types::u16be;
 use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -144,13 +145,21 @@ impl<E: Ipv6Packet> Icmpv6<E> {
     /// Returns an error if the message type in the packet header does not
     /// match the assigned message type for `T`.
     #[inline]
-    pub fn downcast<T: Icmpv6Message<Envelope = E>>(self) -> Result<T, (Error, Self)> {
+    pub fn downcast<T: Icmpv6Message<Envelope = E>>(self) -> Result<T, (T::Error, Self)> {
         ensure!(
             self.msg_type() == T::msg_type(),
-            (anyhow!("the ICMPv6 packet is not {}.", T::msg_type()), self)
+            (
+                IcmpError::IcmpTypeMismatch {
+                    packet_type: self.envelope.next_protocol(),
+                    found: self.msg_type().0,
+                    expected: T::msg_type().0
+                }
+                .into(),
+                self
+            )
         );
 
-        T::try_parse(self, Internal(()))
+        Ok(T::try_parse(self, Internal(()))?)
     }
 }
 
@@ -173,6 +182,7 @@ impl<E: Ipv6Packet> Packet for Icmpv6<E> {
     ///
     /// [IPv6]: crate::packets::ip::v6::Ipv6
     type Envelope = E;
+    type Error = IcmpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -214,17 +224,26 @@ impl<E: Ipv6Packet> Packet for Icmpv6<E> {
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     /// [`ProtocolNumbers::Icmpv6`]: crate::packets::ip::ProtocolNumbers::Icmpv6
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.next_protocol() == ProtocolNumbers::Icmpv6,
-            (anyhow!("not an ICMPv6 packet."), envelope)
+            (
+                IcmpError::InvalidPacketType {
+                    found: envelope.next_protocol(),
+                    expected: ProtocolNumbers::Icmpv6
+                },
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Icmpv6 {
@@ -240,10 +259,11 @@ impl<E: Ipv6Packet> Packet for Icmpv6<E> {
     ///
     /// [`EchoRequest`]: EchoRequest
     #[inline]
-    fn try_push(_envelope: Self::Envelope, _internal: crate::packets::Internal) -> Result<Self> {
-        Err(anyhow!(
-            "cannot push a generic ICMPv6 header without a message body."
-        ))
+    fn try_push(
+        _envelope: Self::Envelope,
+        _internal: crate::packets::Internal,
+    ) -> Result<Self, Self::Error> {
+        Err(IcmpError::DisallowedPush)
     }
 
     #[inline]
@@ -390,6 +410,7 @@ pub struct Icmpv6Header {
 pub trait Icmpv6Message {
     /// The preceding packet type that encapsulates this message.
     type Envelope: Ipv6Packet;
+    type Error: Error + From<IcmpError>;
 
     /// Returns the assigned message type.
     fn msg_type() -> Icmpv6Type;
@@ -423,7 +444,10 @@ pub trait Icmpv6Message {
     ///
     /// [`Icmpv6::downcast`]: Icmpv6::downcast
     /// [`msg_type`]: Icmpv6::msg_type
-    fn try_parse(icmp: Icmpv6<Self::Envelope>, internal: Internal) -> Result<Self, (Error, Icmpv6<Self::Envelope>)>
+    fn try_parse(
+        icmp: Icmpv6<Self::Envelope>,
+        internal: Internal,
+    ) -> Result<Self, (Self::Error, Icmpv6<Self::Envelope>)>
     where
         Self: Sized;
 
@@ -441,7 +465,7 @@ pub trait Icmpv6Message {
     ///
     /// [`msg_type`]: Icmpv6::msg_type
     /// [`Packet::push`]: Packet::push
-    fn try_push(icmp: Icmpv6<Self::Envelope>, internal: Internal) -> Result<Self>
+    fn try_push(icmp: Icmpv6<Self::Envelope>, internal: Internal) -> Result<Self, Self::Error>
     where
         Self: Sized;
 

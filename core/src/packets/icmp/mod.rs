@@ -18,5 +18,28 @@
 
 //! Internet Control Message Protocol for IPv4 and IPv6.
 
+use crate::packets::ip::ProtocolNumber;
+use crate::packets::MbufError;
+use thiserror::Error;
+
 pub mod v4;
 pub mod v6;
+
+#[derive(Error, Debug)]
+pub enum IcmpError {
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("not an ICMP ({expected:?}) packet: {found:?}")]
+    InvalidPacketType {
+        found: ProtocolNumber,
+        expected: ProtocolNumber,
+    },
+    #[error("cannot push a generic ICMP header without a message body")]
+    DisallowedPush,
+    #[error("the ICMP ({expected:?}) packet {found} is not {expected}")]
+    IcmpTypeMismatch {
+        packet_type: ProtocolNumber,
+        found: u8,
+        expected: u8,
+    },
+}

@@ -20,9 +20,9 @@
 //! including calculation involving *pseudo headers*.
 
 use crate::packets::ip::ProtocolNumber;
-use anyhow::{anyhow, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::slice;
+use thiserror::Error;
 
 /// Generic pseudo header used to calculate checksum.
 #[derive(Debug)]
@@ -194,6 +194,12 @@ pub fn compute_inc(old_checksum: u16, old_value: &[u16], new_value: &[u16]) -> u
     !(checksum as u16)
 }
 
+#[derive(Error, Debug)]
+pub enum ChecksumError {
+    #[error("cannot mix IPv4 and IPv6 addresses")]
+    MixedAddresses,
+}
+
 /// Incrementally computes the new checksum for an IP address change.
 ///
 /// # Errors
@@ -203,7 +209,7 @@ pub fn compute_with_ipaddr(
     old_checksum: u16,
     old_value: &IpAddr,
     new_value: &IpAddr,
-) -> Result<u16> {
+) -> Result<u16, ChecksumError> {
     match (old_value, new_value) {
         (IpAddr::V4(old), IpAddr::V4(new)) => {
             let old: u32 = (*old).into();
@@ -215,7 +221,7 @@ pub fn compute_with_ipaddr(
         (IpAddr::V6(old), IpAddr::V6(new)) => {
             Ok(compute_inc(old_checksum, &old.segments(), &new.segments()))
         }
-        _ => Err(anyhow!("cannot mix IPv4 and IPv6 addresses.")),
+        _ => Err(ChecksumError::MixedAddresses),
     }
 }
 

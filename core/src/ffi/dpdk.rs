@@ -19,23 +19,24 @@
 use super::{AsStr, EasyPtr, ToCString, ToResult};
 use crate::net::MacAddr;
 use crate::{debug, error};
-use anyhow::{anyhow, Result};
 use capsule_ffi as cffi;
+use capsule_ffi::rte_flow_error;
+use capsule_ffi::rte_lcore_state_t::Type;
+use std::convert::{TryFrom, TryInto};
+use std::error::Error;
 use std::fmt;
 use std::mem;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::os::raw;
+use std::os::raw::c_uint;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use thiserror::Error;
-use std::mem::MaybeUninit;
 use tracing::trace;
-use std::convert::{TryFrom, TryInto};
-use capsule_ffi::rte_lcore_state_t::Type;
-use std::os::raw::c_uint;
 
 /// Initializes the Environment Abstraction Layer (EAL).
-pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<()> {
+pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<(), DpdkError> {
     let args = args
         .into_iter()
         .map(|s| Into::<String>::into(s).into_cstring())
@@ -56,7 +57,7 @@ pub(crate) fn eal_init<S: Into<String>>(args: Vec<S>) -> Result<()> {
 }
 
 /// Cleans up the Environment Abstraction Layer (EAL).
-pub(crate) fn eal_cleanup() -> Result<()> {
+pub(crate) fn eal_cleanup() -> Result<(), DpdkError> {
     unsafe { cffi::rte_eal_cleanup() }
         .into_result(DpdkError::from_errno)
         .map(|_| ())
@@ -106,7 +107,7 @@ pub(crate) fn pktmbuf_pool_create<S: Into<String>>(
     capacity: usize,
     cache_size: usize,
     socket_id: SocketId,
-) -> Result<MempoolPtr> {
+) -> Result<MempoolPtr, DpdkError> {
     let name: String = name.into();
 
     let ptr = unsafe {
@@ -126,7 +127,7 @@ pub(crate) fn pktmbuf_pool_create<S: Into<String>>(
 
 /// Looks up a mempool by the name.
 #[cfg(test)]
-pub(crate) fn mempool_lookup<S: Into<String>>(name: S) -> Result<MempoolPtr> {
+pub(crate) fn mempool_lookup<S: Into<String>>(name: S) -> Result<MempoolPtr, DpdkError> {
     let name: String = name.into();
 
     let ptr = unsafe {
@@ -155,7 +156,7 @@ pub(crate) fn mempool_free(mp: &mut MempoolPtr) {
 
 /// An opaque identifier for a logical execution unit of the processor.
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
-pub(crate) struct LcoreId(raw::c_uint);
+pub struct LcoreId(raw::c_uint);
 
 impl Into<raw::c_uint> for LcoreId {
     fn into(self) -> c_uint {
@@ -226,15 +227,17 @@ pub(crate) fn get_next_lcore(
 }
 
 /// The function passed to `rte_eal_remote_launch`.
-unsafe extern "C" fn lcore_fn<F>(arg: *mut raw::c_void) -> raw::c_int
+unsafe extern "C" fn lcore_fn<F, E>(arg: *mut raw::c_void) -> raw::c_int
 where
-    F: FnOnce() -> Result<Option<i32>> + Send + 'static,
+    E: Error,
+    F: FnOnce() -> Result<Option<i32>, E> + Send + 'static,
 {
     let f = Box::from_raw(arg as *mut F);
 
     // in case the closure panics, let's not crash the app.
     let res = panic::catch_unwind(AssertUnwindSafe(f));
-    let result = match res {
+
+    /* let result = match res {
         Ok(Ok(opt)) => Ok(opt.map(|val| val.into())),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("Panicked")),
@@ -244,23 +247,50 @@ where
         Err(err) => {
             error!(lcore = ?LcoreId::current(), error = ?err, "failed to execute closure.");
             -2
-        },
+        }
         Ok(None) => -1,
-        Ok(Some(val)) => val
-    }
+        Ok(Some(val)) => val,
+    }; */
+    return match res {
+        Ok(Ok(opt)) => match opt {
+            Some(val) => val.into(),
+            None => -1,
+        },
+        Ok(Err(e)) => {
+            error!(lcore = ?LcoreId::current(), error = ?e, "Closure returned an error");
+            -2
+        }
+        Err(e) => {
+            error!(lcore = ?LcoreId::current(), error = ?e, "Closure panicked");
+            -2
+        }
+    };
+}
+
+#[derive(Error, Debug)]
+pub enum DpdkLcoreError {
+    #[error("dpdk error")]
+    DpdkError(#[from] DpdkError),
+    #[error("Not a valid LCoreState: {0}")]
+    InvalidState(cffi::rte_lcore_state_t::Type),
+    #[error("LCore function returned an error")]
+    CoreError,
 }
 
 /// Launches a function on another lcore.
-pub(crate) fn eal_remote_launch<F>(worker_id: LcoreId, f: F) -> Result<()>
+pub(crate) fn eal_remote_launch<F, E>(worker_id: LcoreId, f: F) -> Result<(), DpdkLcoreError>
 where
-    F: FnOnce() -> Result<Option<i32>> + Send + 'static,
+    E: Error,
+    F: FnOnce() -> Result<Option<i32>, E> + Send + 'static,
 {
     let ptr = Box::into_raw(Box::new(f)) as *mut raw::c_void;
 
     unsafe {
-        cffi::rte_eal_remote_launch(Some(lcore_fn::<F>), ptr, worker_id.0)
-            .into_result(DpdkError::from_errno)
-            .map(|_| ())
+        Ok(
+            cffi::rte_eal_remote_launch(Some(lcore_fn::<F, E>), ptr, worker_id.0)
+                .into_result(DpdkError::from_errno)
+                .map(|_| ())?,
+        )
     }
 }
 
@@ -271,32 +301,30 @@ pub(crate) enum LcoreState {
 }
 
 impl TryFrom<cffi::rte_lcore_state_t::Type> for LcoreState {
-    type Error = anyhow::Error;
+    type Error = DpdkLcoreError;
 
     fn try_from(value: Type) -> std::result::Result<Self, Self::Error> {
         match value {
             cffi::rte_lcore_state_t::WAIT => Ok(LcoreState::WAIT),
             cffi::rte_lcore_state_t::RUNNING => Ok(LcoreState::RUNNING),
             cffi::rte_lcore_state_t::FINISHED => Ok(LcoreState::FINISHED),
-            _ => {
-                Err(anyhow!("Not a valid LCoreState"))
-            }
+            other => Err(DpdkLcoreError::InvalidState(other)),
         }
     }
 }
 
 /// Get the state of the lcore identified by worker_id.
-pub(crate) fn eal_get_lcore_state(worker_id: LcoreId) -> Result<LcoreState> {
+pub(crate) fn eal_get_lcore_state(worker_id: LcoreId) -> Result<LcoreState, DpdkLcoreError> {
     unsafe { cffi::rte_eal_get_lcore_state(worker_id.0) }.try_into()
 }
 
 /// Wait until an lcore finishes its job.
 /// Ignores the return value.
-pub(crate) fn eal_wait_lcore(worker_id: LcoreId) -> Result<Option<i32>> {
+pub(crate) fn eal_wait_lcore(worker_id: LcoreId) -> Result<Option<i32>, DpdkLcoreError> {
     match unsafe { cffi::rte_eal_wait_lcore(worker_id.0) }.into() {
-        -2 => Err(anyhow!("LCore function returned an error")),
+        -2 => Err(DpdkLcoreError::CoreError),
         -1 => Ok(None),
-        val => Ok(Some(val))
+        val => Ok(Some(val)),
     }
 }
 
@@ -312,7 +340,9 @@ impl PortId {
     }
 
     /// Returns the port ID
-    pub(crate) fn id(self) -> u16 { self.0 }
+    pub(crate) fn id(self) -> u16 {
+        self.0
+    }
 }
 
 impl fmt::Debug for PortId {
@@ -322,7 +352,7 @@ impl fmt::Debug for PortId {
 }
 
 /// Gets the port id from device name.
-pub(crate) fn eth_dev_get_port_by_name<S: Into<String>>(name: S) -> Result<PortId> {
+pub(crate) fn eth_dev_get_port_by_name<S: Into<String>>(name: S) -> Result<PortId, DpdkError> {
     let name: String = name.into();
     let mut port_id = 0u16;
     unsafe {
@@ -333,7 +363,7 @@ pub(crate) fn eth_dev_get_port_by_name<S: Into<String>>(name: S) -> Result<PortI
 }
 
 /// Retrieves the Ethernet address of a device.
-pub(crate) fn eth_macaddr_get(port_id: PortId) -> Result<MacAddr> {
+pub(crate) fn eth_macaddr_get(port_id: PortId) -> Result<MacAddr, DpdkError> {
     let mut addr = cffi::rte_ether_addr::default();
     unsafe {
         cffi::rte_eth_macaddr_get(port_id.0, &mut addr).into_result(DpdkError::from_errno)?;
@@ -342,7 +372,7 @@ pub(crate) fn eth_macaddr_get(port_id: PortId) -> Result<MacAddr> {
 }
 
 /// Retrieves the contextual information of a device.
-pub(crate) fn eth_dev_info_get(port_id: PortId) -> Result<cffi::rte_eth_dev_info> {
+pub(crate) fn eth_dev_info_get(port_id: PortId) -> Result<cffi::rte_eth_dev_info, DpdkError> {
     let mut port_info = cffi::rte_eth_dev_info::default();
     unsafe {
         cffi::rte_eth_dev_info_get(port_id.0, &mut port_info).into_result(DpdkError::from_errno)?;
@@ -356,7 +386,7 @@ pub(crate) fn eth_dev_adjust_nb_rx_tx_desc(
     port_id: PortId,
     nb_rx_desc: usize,
     nb_tx_desc: usize,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize), DpdkError> {
     let mut nb_rx_desc = nb_rx_desc as u16;
     let mut nb_tx_desc = nb_tx_desc as u16;
 
@@ -377,7 +407,7 @@ pub(crate) fn eth_promiscuous_get(port_id: PortId) -> bool {
 }
 
 /// Enables receipt in promiscuous mode for a device.
-pub(crate) fn eth_promiscuous_enable(port_id: PortId) -> Result<()> {
+pub(crate) fn eth_promiscuous_enable(port_id: PortId) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_promiscuous_enable(port_id.0)
             .into_result(DpdkError::from_errno)
@@ -386,7 +416,7 @@ pub(crate) fn eth_promiscuous_enable(port_id: PortId) -> Result<()> {
 }
 
 /// Disables receipt in promiscuous mode for a device.
-pub(crate) fn eth_promiscuous_disable(port_id: PortId) -> Result<()> {
+pub(crate) fn eth_promiscuous_disable(port_id: PortId) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_promiscuous_disable(port_id.0)
             .into_result(DpdkError::from_errno)
@@ -403,7 +433,7 @@ pub(crate) fn eth_allmulticast_get(port_id: PortId) -> bool {
 }
 
 /// Enables the receipt of any multicast frame by a device.
-pub(crate) fn eth_allmulticast_enable(port_id: PortId) -> Result<()> {
+pub(crate) fn eth_allmulticast_enable(port_id: PortId) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_allmulticast_enable(port_id.0)
             .into_result(DpdkError::from_errno)
@@ -412,7 +442,7 @@ pub(crate) fn eth_allmulticast_enable(port_id: PortId) -> Result<()> {
 }
 
 /// Disables the receipt of any multicast frame by a device.
-pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
+pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_allmulticast_disable(port_id.0)
             .into_result(DpdkError::from_errno)
@@ -420,9 +450,45 @@ pub(crate) fn eth_allmulticast_disable(port_id: PortId) -> Result<()> {
     }
 }
 
+#[derive(Error, Debug)]
+#[error("{message} (error type: {type_})")]
+struct FlowError {
+    message: String,
+    type_: u32,
+}
+
+impl From<rte_flow_error> for FlowError {
+    fn from(flow_err: rte_flow_error) -> Self {
+        Self {
+            message: flow_err.message.as_str().to_string(),
+            type_: flow_err.type_,
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("Symmetric RSS flow rule for RSS type(s) '{rss_hf}' and protocol stack '{proto_stack:?}' create failed, detail: {flow_error:?}")]
+pub struct SymmetricRSSError {
+    rss_hf: u64,
+    proto_stack: Vec<cffi::rte_flow_item_type::Type>,
+    flow_error: FlowError,
+    #[source]
+    dpdk_error: DpdkError,
+}
+
 /// Creates a symmetric RSS flow rule for a device with a specific protocol match and RSS type
-fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<cffi::rte_flow_item_type::Type>, num_queues: usize) -> Result<&'static cffi::rte_flow> {
-    trace!("Creating symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}", port_id, rss_hf, proto_stack);
+fn eth_sym_rss_flow_rule_create(
+    port_id: PortId,
+    rss_hf: u64,
+    proto_stack: Vec<cffi::rte_flow_item_type::Type>,
+    num_queues: usize,
+) -> Result<&'static cffi::rte_flow, SymmetricRSSError> {
+    trace!(
+        "Creating symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}",
+        port_id,
+        rss_hf,
+        proto_stack
+    );
     // Create pattern items
     let mut flow_items: Vec<cffi::rte_flow_item> = Vec::new();
     for proto in &proto_stack {
@@ -430,7 +496,7 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
             type_: proto.clone(),
             spec: ptr::null(),
             last: ptr::null(),
-            mask: ptr::null()
+            mask: ptr::null(),
         })
     }
     // Push end item
@@ -438,7 +504,7 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
         type_: cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_END,
         spec: ptr::null(),
         last: ptr::null(),
-        mask: ptr::null()
+        mask: ptr::null(),
     });
     // Create config for RSS action type
     let flow_action_rss_conf = cffi::rte_flow_action_rss {
@@ -448,72 +514,113 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
         key_len: 0,
         queue_num: num_queues as u32,
         key: ptr::null(),
-        queue: ptr::null()
+        queue: ptr::null(),
     };
     // Creation action items
     let flow_action_rss_conf_ptr: *const cffi::rte_flow_action_rss = &flow_action_rss_conf;
     let flow_action_rss = cffi::rte_flow_action {
         type_: cffi::rte_flow_action_type::RTE_FLOW_ACTION_TYPE_RSS,
-        conf: flow_action_rss_conf_ptr as *const raw::c_void
+        conf: flow_action_rss_conf_ptr as *const raw::c_void,
     };
     let flow_action_end = cffi::rte_flow_action {
         type_: cffi::rte_flow_action_type::RTE_FLOW_ACTION_TYPE_END,
-        conf: ptr::null()
+        conf: ptr::null(),
     };
     let flow_actions = [flow_action_rss, flow_action_end];
     let flow_attr = cffi::rte_flow_attr {
         group: 0,
         priority: 0,
         _bitfield_align_1: [],
-        _bitfield_1: cffi::rte_flow_attr::new_bitfield_1(1, 0, 0, 0)
+        _bitfield_1: cffi::rte_flow_attr::new_bitfield_1(1, 0, 0, 0),
     };
     let mut flow_error_uninit = MaybeUninit::<cffi::rte_flow_error>::uninit();
-    match unsafe { cffi::rte_flow_create(port_id.0,
-                                                          &flow_attr,
-                                                          flow_items.as_ptr(),
-                                                          flow_actions.as_ptr(),
-                                                          flow_error_uninit.as_mut_ptr()).as_ref() } {
+    match unsafe {
+        cffi::rte_flow_create(
+            port_id.0,
+            &flow_attr,
+            flow_items.as_ptr(),
+            flow_actions.as_ptr(),
+            flow_error_uninit.as_mut_ptr(),
+        )
+        .as_ref()
+    } {
         Some(flow_rule) => {
-            trace!("Created symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}", port_id, rss_hf, proto_stack);
+            trace!(
+                "Created symmetric RSS flow rule for {:?} with rss_hf: {} and protos: {:?}",
+                port_id,
+                rss_hf,
+                proto_stack
+            );
             Ok(flow_rule)
-        },
+        }
         None => {
-            let rte_error = DpdkError::new();
             let flow_error = unsafe { flow_error_uninit.assume_init() };
-            Err(anyhow!("Symmetric RSS flow rule for RSS type(s) '{:?}' and protocol stack '{:?}' create failed: {}, detail: {} ({})", rss_hf, proto_stack, rte_error, flow_error.message.as_str(), flow_error.type_))
+            Err(SymmetricRSSError {
+                rss_hf,
+                proto_stack,
+                flow_error: flow_error.into(),
+                dpdk_error: DpdkError::new(),
+            })
         }
     }
 }
 
 /// Enables symmetric RSS for a device
-pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<()> {
+pub(crate) fn eth_sym_rss_enable(
+    port_id: PortId,
+    num_queues: usize,
+) -> Result<(), SymmetricRSSError> {
     let specs = vec![
         // IPv4 UDP
-        (cffi::ETH_RSS_NONFRAG_IPV4_UDP,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
-              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV4_UDP,
+            vec![
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP,
+            ],
+        ),
         // IPv4 TCP
-        (cffi::ETH_RSS_NONFRAG_IPV4_TCP,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
-              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV4_TCP,
+            vec![
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP,
+            ],
+        ),
         // IPv4
-        (cffi::ETH_RSS_FRAG_IPV4,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4]),
-        (cffi::ETH_RSS_NONFRAG_IPV4_OTHER,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4]),
+        (
+            cffi::ETH_RSS_FRAG_IPV4,
+            vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4],
+        ),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV4_OTHER,
+            vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4],
+        ),
         // IPv6 UDP
-        (cffi::ETH_RSS_NONFRAG_IPV6_UDP,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
-              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV6_UDP,
+            vec![
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP,
+            ],
+        ),
         // IPv6 TCP
-        (cffi::ETH_RSS_NONFRAG_IPV6_TCP,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
-              cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV6_TCP,
+            vec![
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
+                cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP,
+            ],
+        ),
         // IPv6
-        (cffi::ETH_RSS_FRAG_IPV6,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
-        (cffi::ETH_RSS_NONFRAG_IPV6_OTHER,
-         vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
+        (
+            cffi::ETH_RSS_FRAG_IPV6,
+            vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6],
+        ),
+        (
+            cffi::ETH_RSS_NONFRAG_IPV6_OTHER,
+            vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6],
+        ),
     ];
     for (rss_hf, mut protos) in specs {
         protos.insert(0, cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_ETH);
@@ -528,7 +635,7 @@ pub(crate) fn eth_dev_configure(
     nb_rx_queue: usize,
     nb_tx_queue: usize,
     eth_conf: &cffi::rte_eth_conf,
-) -> Result<()> {
+) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_dev_configure(port_id.0, nb_rx_queue as u16, nb_tx_queue as u16, eth_conf)
             .into_result(DpdkError::from_errno)
@@ -542,7 +649,9 @@ pub(crate) struct PortQueueId(u16);
 
 impl PortQueueId {
     /// Returns the queue ID
-    pub(crate) fn id(self) -> u16 { self.0 }
+    pub(crate) fn id(self) -> u16 {
+        self.0
+    }
 }
 
 impl fmt::Debug for PortQueueId {
@@ -571,7 +680,7 @@ pub(crate) fn eth_rx_queue_setup(
     socket_id: SocketId,
     rx_conf: Option<&cffi::rte_eth_rxconf>,
     mb_pool: &mut MempoolPtr,
-) -> Result<()> {
+) -> std::result::Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_rx_queue_setup(
             port_id.0,
@@ -623,7 +732,7 @@ pub(crate) fn eth_add_rx_callback<T>(
     queue_id: PortQueueId,
     callback: cffi::rte_rx_callback_fn,
     user_param: &mut T,
-) -> Result<RxTxCallbackGuard> {
+) -> Result<RxTxCallbackGuard, DpdkError> {
     let ptr = unsafe {
         cffi::rte_eth_add_rx_callback(
             port_id.0,
@@ -660,7 +769,7 @@ pub(crate) fn eth_tx_queue_setup(
     nb_tx_desc: usize,
     socket_id: SocketId,
     tx_conf: Option<&cffi::rte_eth_txconf>,
-) -> Result<()> {
+) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_tx_queue_setup(
             port_id.0,
@@ -681,7 +790,7 @@ pub(crate) fn eth_add_tx_callback<T>(
     queue_id: PortQueueId,
     callback: cffi::rte_tx_callback_fn,
     user_param: &mut T,
-) -> Result<RxTxCallbackGuard> {
+) -> Result<RxTxCallbackGuard, DpdkError> {
     let ptr = unsafe {
         cffi::rte_eth_add_tx_callback(
             port_id.0,
@@ -725,7 +834,7 @@ pub(crate) fn eth_tx_burst(
 }
 
 /// Starts a device.
-pub(crate) fn eth_dev_start(port_id: PortId) -> Result<()> {
+pub(crate) fn eth_dev_start(port_id: PortId) -> Result<(), DpdkError> {
     unsafe {
         cffi::rte_eth_dev_start(port_id.0)
             .into_result(DpdkError::from_errno)
@@ -741,7 +850,7 @@ pub(crate) fn eth_dev_stop(port_id: PortId) {
 }
 
 /// Get port statistics
-pub(crate) fn eth_stats_get(port_id: PortId) -> Result<cffi::rte_eth_stats> {
+pub(crate) fn eth_stats_get(port_id: PortId) -> Result<cffi::rte_eth_stats, DpdkError> {
     let mut stats = cffi::rte_eth_stats::default();
     unsafe {
         cffi::rte_eth_stats_get(port_id.0, &mut stats)
@@ -757,7 +866,7 @@ pub(crate) type MbufPtr = EasyPtr<cffi::rte_mbuf>;
 unsafe impl Send for MbufPtr {}
 
 /// Allocates a new mbuf from a mempool.
-pub(crate) fn pktmbuf_alloc(mp: &mut MempoolPtr) -> Result<MbufPtr> {
+pub(crate) fn pktmbuf_alloc(mp: &mut MempoolPtr) -> Result<MbufPtr, DpdkError> {
     let ptr =
         unsafe { cffi::_rte_pktmbuf_alloc(mp.deref_mut()).into_result(|_| DpdkError::new())? };
 
@@ -765,7 +874,10 @@ pub(crate) fn pktmbuf_alloc(mp: &mut MempoolPtr) -> Result<MbufPtr> {
 }
 
 /// Allocates a bulk of mbufs.
-pub(crate) fn pktmbuf_alloc_bulk(mp: &mut MempoolPtr, mbufs: &mut Vec<MbufPtr>) -> Result<()> {
+pub(crate) fn pktmbuf_alloc_bulk(
+    mp: &mut MempoolPtr,
+    mbufs: &mut Vec<MbufPtr>,
+) -> std::result::Result<(), DpdkError> {
     let len = mbufs.capacity();
 
     unsafe {
@@ -831,7 +943,7 @@ pub(crate) fn pktmbuf_free_bulk(mbufs: &mut Vec<MbufPtr>) {
 /// When an FFI call fails, the `errno` is translated into `DpdkError`.
 #[derive(Debug, Error)]
 #[error("{0}")]
-pub(crate) struct DpdkError(String);
+pub struct DpdkError(String);
 
 impl DpdkError {
     /// Returns the `DpdkError` for the most recent failure on the current

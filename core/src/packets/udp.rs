@@ -19,15 +19,16 @@
 //! User Datagram Protocol.
 
 use crate::ensure;
+use crate::packets::checksum::ChecksumError;
 use crate::packets::ip::v4::Ipv4;
 use crate::packets::ip::v6::Ipv6;
-use crate::packets::ip::{Flow, IpPacket, ProtocolNumbers};
+use crate::packets::ip::{Flow, IpError, IpPacket, ProtocolNumber, ProtocolNumbers};
 use crate::packets::types::u16be;
-use crate::packets::{checksum, Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
+use crate::packets::{checksum, Internal, MbufError, Packet, SizeOf};
 use std::fmt;
 use std::net::IpAddr;
 use std::ptr::NonNull;
+use thiserror::Error;
 
 /// User Datagram Protocol packet based on [IETF RFC 768].
 ///
@@ -76,6 +77,21 @@ pub struct Udp<E: IpPacket> {
     offset: usize,
 }
 
+#[derive(Error, Debug)]
+pub enum UdpError {
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("ip packet error")]
+    // IpPacketError(#[from] E::IpError), // TODO req negative_impl
+    IpPacketError(#[from] IpError),
+    #[error("not a udp packet: {0}")]
+    InvalidPacketType(ProtocolNumber),
+    #[error("checksum error")]
+    ChecksumError(#[from] ChecksumError),
+}
+
+// impl<E: IpPacket> !IpPacketError for UdpError<E> {} // TODO req negative_impl
+
 impl<E: IpPacket> Udp<E> {
     #[inline]
     fn header(&self) -> &UdpHeader {
@@ -121,9 +137,10 @@ impl<E: IpPacket> Udp<E> {
 
     /// Swap source and destination ports and addresses of the underlying protocol
     #[inline]
-    pub fn swap_addresses_and_ports(&mut self) -> Result<()> {
+    pub fn swap_addresses_and_ports(&mut self) -> Result<(), UdpError> {
         self.swap_ports();
-        self.envelope_mut().swap_addresses()
+        self.envelope_mut().swap_addresses()?;
+        Ok(())
     }
 
     /// Returns the length in octets of this user datagram including this
@@ -201,7 +218,7 @@ impl<E: IpPacket> Udp<E> {
     /// the UDP packet is inside a IPv4 packet, the `src_ip` must be an
     /// Ipv4Addr.
     #[inline]
-    pub fn set_src_ip(&mut self, src_ip: IpAddr) -> Result<()> {
+    pub fn set_src_ip(&mut self, src_ip: IpAddr) -> Result<(), UdpError> {
         let old_ip = self.envelope().src();
         let checksum = checksum::compute_with_ipaddr(self.checksum(), &old_ip, &src_ip)?;
         self.envelope_mut().set_src(src_ip)?;
@@ -222,7 +239,7 @@ impl<E: IpPacket> Udp<E> {
     /// the UDP packet is inside a IPv4 packet, the `dst_ip` must be an
     /// Ipv4Addr.
     #[inline]
-    pub fn set_dst_ip(&mut self, dst_ip: IpAddr) -> Result<()> {
+    pub fn set_dst_ip(&mut self, dst_ip: IpAddr) -> Result<(), UdpError> {
         let old_ip = self.envelope().dst();
         let checksum = checksum::compute_with_ipaddr(self.checksum(), &old_ip, &dst_ip)?;
         self.envelope_mut().set_dst(dst_ip)?;
@@ -270,6 +287,7 @@ impl<E: IpPacket> Packet for Udp<E> {
     /// [IPv4]: crate::packets::ip::v4::Ipv4
     /// [IPv6]: crate::packets::ip::v6::Ipv6
     type Envelope = E;
+    type Error = UdpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -314,17 +332,23 @@ impl<E: IpPacket> Packet for Udp<E> {
     /// [`ProtocolNumbers::Udp`]: crate::packets::ip::ProtocolNumbers::Udp
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.next_protocol() == ProtocolNumbers::Udp,
-            (anyhow!("not a UDP packet."), envelope)
+            (
+                UdpError::InvalidPacketType(envelope.next_protocol()),
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         Ok(Udp {
@@ -348,7 +372,7 @@ impl<E: IpPacket> Packet for Udp<E> {
     /// [`ProtocolNumbers::Udp`]: crate::packets::ip::ProtocolNumbers::Udp
     /// [`next_header`]: crate::packets::ip::v6::Ipv6Packet::next_header
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -464,13 +488,13 @@ mod tests {
         let old_checksum = udp.checksum();
         let new_ip = Ipv4Addr::new(10, 0, 0, 0);
         assert!(udp.set_src_ip(new_ip.into()).is_ok());
-        assert!(udp.checksum() != old_checksum);
+        assert_ne!(udp.checksum(), old_checksum);
         assert_eq!(new_ip.to_string(), udp.envelope().src().to_string());
 
         let old_checksum = udp.checksum();
         let new_ip = Ipv4Addr::new(20, 0, 0, 0);
         assert!(udp.set_dst_ip(new_ip.into()).is_ok());
-        assert!(udp.checksum() != old_checksum);
+        assert_ne!(udp.checksum(), old_checksum);
         assert_eq!(new_ip.to_string(), udp.envelope().dst().to_string());
 
         // can't set v6 addr on a v4 packet

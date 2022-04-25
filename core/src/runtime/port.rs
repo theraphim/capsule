@@ -17,24 +17,26 @@
 */
 
 use super::{LcoreMap, Mempool};
-use crate::ffi::dpdk::{self, MbufPtr, PortId, PortQueueId};
+use crate::ffi::dpdk::{self, DpdkError, MbufPtr, PortId, PortQueueId, SymmetricRSSError};
 use crate::net::MacAddr;
 use crate::packets::{Mbuf, Postmark};
+#[cfg(feature = "metrics")]
+use crate::runtime::port_metrics::{PortRxQueueStats, PortTxQueueStats, PORT_QUEUE_STATS};
+use crate::runtime::LcoreError;
 use crate::{debug, ensure, error, info, warn};
-use anyhow::Result;
 use capsule_ffi as cffi;
+#[cfg(feature = "metrics")]
+use metrics::{counter, gauge};
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
 use std::fmt;
+#[cfg(feature = "metrics")]
+use std::sync::atomic::Ordering;
+use std::thread::sleep;
+use std::time::Duration;
 use thiserror::Error;
 use triggered::Listener;
-use std::time::Duration;
-use std::thread::sleep;
-#[cfg(feature = "metrics")]
-use metrics::{gauge, counter};
-#[cfg(feature = "metrics")]
-use crate::runtime::port_metrics::{PORT_QUEUE_STATS, PortRxQueueStats, PortTxQueueStats};
-#[cfg(feature = "metrics")]
-use std::sync::atomic::{Ordering};
 
 /// A PMD device port.
 #[derive(PartialEq)]
@@ -42,6 +44,45 @@ pub struct Port {
     name: String,
     port_id: PortId,
     lcores: Vec<usize>,
+}
+
+/// Port related errors.
+#[derive(Debug, Error)]
+pub enum PortError {
+    #[error("dpdk error")]
+    DpdkError(#[from] DpdkError),
+
+    #[error("Lcore error")]
+    LcoreError(#[from] LcoreError),
+
+    #[error("Failed to set symmetric RSS")]
+    SymmetricRssError(#[from] SymmetricRSSError),
+
+    /// The port is not found.
+    #[error("port not found.")]
+    NotFound,
+
+    /// The maximum number of RX queues is less than the number of queues
+    /// requested.
+    #[error("insufficient number of receive queues. max is {0}.")]
+    InsufficientRxQueues(u16),
+
+    /// The maximum number of TX queues is less than the number of queues
+    /// requested.
+    #[error("insufficient number of transmit queues. max is {0}.")]
+    InsufficientTxQueues(u16),
+
+    /// The port has no lcores
+    #[error("receive not enabled on port.")]
+    NoLCores,
+
+    /// The pipeline for the port is already set.
+    #[error("pipeline already set.")]
+    PipelineSet,
+
+    /// Symmetric RSS cannot be disabled
+    #[error("symmetric RSS cannot be disabled")]
+    SymRSSNoDisable,
 }
 
 impl Port {
@@ -64,9 +105,15 @@ impl Port {
     }
 
     /// Returns a queue ID mathematically associated with the given queue ID on another port
-    pub(crate) fn associated_queue(&self, other_port: &Port, other_queue: PortQueueId) -> PortQueueId {
+    pub(crate) fn associated_queue(
+        &self,
+        other_port: &Port,
+        other_queue: PortQueueId,
+    ) -> PortQueueId {
         let other_queue_id: usize = other_queue.into();
-        ((other_queue_id as f32 * (self.lcores.len() as f32 / other_port.lcores().len() as f32)) as usize).into()
+        ((other_queue_id as f32 * (self.lcores.len() as f32 / other_port.lcores().len() as f32))
+            as usize)
+            .into()
     }
 
     /// Returns the MAC address of the port.
@@ -88,7 +135,7 @@ impl Port {
 
     #[cfg(feature = "metrics")]
     /// Collects/updates port and assosciated queue metrics
-    pub(crate) fn collect_metrics(&self) -> Result<()> {
+    pub(crate) fn collect_metrics(&self) -> Result<(), PortError> {
         let port_stats = dpdk::eth_stats_get(self.port_id)?;
         let port_gauge = |name: &'static str, value| {
             gauge!(format!("port.dpdk.{}", name), value,
@@ -103,7 +150,10 @@ impl Port {
         port_gauge("rx_errors", port_stats.ierrors as f64);
         port_gauge("tx_errors", port_stats.oerrors as f64);
         port_gauge("port.dpdk.rx_mbuf_errors", port_stats.rx_nombuf as f64);
-        for (index, stat) in PORT_QUEUE_STATS[self.port_id.id() as usize][0..self.lcores.len()].iter().enumerate() {
+        for (index, stat) in PORT_QUEUE_STATS[self.port_id.id() as usize][0..self.lcores.len()]
+            .iter()
+            .enumerate()
+        {
             counter!("port.rx_burst_nonempty", stat.rx.cnt_burst_nonempty.swap(0, Ordering::Relaxed),
                 "port_id" => self.port_id.id().to_string(), "queue_id" => index.to_string());
             counter!("port.rx_burst_empty", stat.rx.cnt_burst_empty.swap(0, Ordering::Relaxed),
@@ -116,20 +166,27 @@ impl Port {
 
     /// Spawns an infinite RX->TX pipeline with the given function and optionally a different port
     /// for TX
-    pub fn spawn_rx_tx_pipeline<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+    pub fn spawn_rx_tx_pipeline<PipelineFn, PipelineFnError, ThreadLocalCreatorFn, ThreadLocal>(
         &self,
         lcore_map: &LcoreMap,
         pipeline_fn: PipelineFn,
         thread_local_creator_fn: ThreadLocalCreatorFn,
-        mut tx_port: Option<&Port>
-    ) -> Result<()>
+        mut tx_port: Option<&Port>,
+    ) -> Result<(), PortError>
     where
-        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+        PipelineFnError: Error,
+        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark, PipelineFnError>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
         ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
-        ThreadLocal: Send + 'static
+        ThreadLocal: Send + 'static,
     {
         if let Some(port) = tx_port {
-            if port == self { tx_port = None }
+            if port == self {
+                tx_port = None
+            }
         }
 
         // can't run loop without assigned cores.
@@ -146,23 +203,25 @@ impl Port {
             // get tx queue ID based on queue ID on the current port
             let (tx_port_id, tx_queue_id) = match tx_port {
                 Some(port) => (port.port_id(), port.associated_queue(&self, rx_queue_id)),
-                None => (self.port_id, rx_queue_id)
+                None => (self.port_id, rx_queue_id),
             };
 
             let port_id = self.port_id.clone();
-            lcore.run_single(move |shutdown_listener| {
-                rx_tx_pipeline_loop(
-                    port_id,
-                    rx_queue_id,
-                    tx_port_id,
-                    tx_queue_id,
-                    32,
-                    pipeline_fn,
-                    thread_local_creator_fn,
-                    shutdown_listener
-                );
-                Ok(None)
-            })?;
+            lcore.run_single(
+                move |shutdown_listener| -> Result<Option<i32>, Infallible> {
+                    rx_tx_pipeline_loop(
+                        port_id,
+                        rx_queue_id,
+                        tx_port_id,
+                        tx_queue_id,
+                        32,
+                        pipeline_fn,
+                        thread_local_creator_fn,
+                        shutdown_listener,
+                    );
+                    Ok(None)
+                },
+            )?;
         }
 
         Ok(())
@@ -170,18 +229,23 @@ impl Port {
 
     /// Spawns an infinite TX pipeline with the given function, batch size and optional delay between batches
     /// for TX
-    pub fn spawn_tx_pipeline<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+    pub fn spawn_tx_pipeline<PipelineFn, PipelineFnError, ThreadLocalCreatorFn, ThreadLocal>(
         &self,
         lcore_map: &LcoreMap,
         batch_size: usize,
         delay: Option<Duration>,
         pipeline_fn: PipelineFn,
         thread_local_creator_fn: ThreadLocalCreatorFn,
-    ) -> Result<()>
-        where
-            PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf> + Clone + Send + Sync + 'static,
-            ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
-            ThreadLocal: Send + 'static
+    ) -> Result<(), PortError>
+    where
+        PipelineFnError: Error,
+        PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf, PipelineFnError>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
+        ThreadLocal: Send + 'static,
     {
         // can't run loop without assigned cores.
         ensure!(!self.lcores.is_empty(), PortError::NoLCores);
@@ -195,19 +259,21 @@ impl Port {
 
             let port_id = self.port_id.clone();
             let tx_queue_id: PortQueueId = index.clone().into();
-            lcore.run_single(move |shutdown_listener| {
-                let thread_locals = thread_local_creator_fn();
-                tx_pipeline_loop(
-                    port_id,
-                    tx_queue_id,
-                    batch_size,
-                    delay,
-                    pipeline_fn,
-                    thread_locals,
-                    shutdown_listener
-                );
-                Ok(None)
-            })?;
+            lcore.run_single(
+                move |shutdown_listener| -> Result<Option<i32>, Infallible> {
+                    let thread_locals = thread_local_creator_fn();
+                    tx_pipeline_loop(
+                        port_id,
+                        tx_queue_id,
+                        batch_size,
+                        delay,
+                        pipeline_fn,
+                        thread_locals,
+                        shutdown_listener,
+                    );
+                    Ok(None)
+                },
+            )?;
         }
 
         Ok(())
@@ -219,7 +285,7 @@ impl Port {
     /// # Errors
     ///
     /// Returns `DpdkError` if the port fails to start.
-    pub(crate) fn start(&self) -> Result<()> {
+    pub(crate) fn start(&self) -> Result<(), PortError> {
         dpdk::eth_dev_start(self.port_id)?;
         info!(port = ?self.name, "port started.");
         Ok(())
@@ -259,13 +325,10 @@ impl PortRxQueue {
         return Self {
             port_id,
             queue_id,
-            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].rx
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].rx,
         };
         #[cfg(not(feature = "metrics"))]
-        return Self {
-            port_id,
-            queue_id,
-        };
+        return Self { port_id, queue_id };
     }
 
     /// Receives a burst of packets, up to the `Vec`'s capacity.
@@ -275,14 +338,16 @@ impl PortRxQueue {
         // Record metrics for the size of the burst received to track
         // performance (if the ratio of empty to full buffers is 1, we are "maxed out")
         if mbufs.len() > 0 {
-            self.stats.cnt_burst_nonempty.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .cnt_burst_nonempty
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             self.stats.cnt_burst_empty.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
+fn rx_tx_pipeline_loop<PipelineFn, PipelineFnError, ThreadLocalCreatorFn, ThreadLocal>(
     rx_port_id: PortId,
     rx_queue_id: PortQueueId,
     tx_port_id: PortId,
@@ -290,11 +355,16 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
     batch_size: usize,
     pipeline_fn: PipelineFn,
     thread_local_creator_fn: ThreadLocalCreatorFn,
-    shutdown_listener: Listener
+    shutdown_listener: Listener,
 ) where
-    PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark> + Clone + Send + Sync + 'static,
+    PipelineFnError: Error,
+    PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Postmark, PipelineFnError>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     ThreadLocalCreatorFn: Fn() -> ThreadLocal + Clone + Send + 'static,
-    ThreadLocal: Send + 'static
+    ThreadLocal: Send + 'static,
 {
     let mut thread_locals = thread_local_creator_fn();
 
@@ -316,7 +386,7 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
                     if let Some(drop) = postmark.drop {
                         drops.push(drop);
                     }
-                },
+                }
                 Err(_) => (),
             }
         }
@@ -333,34 +403,32 @@ fn rx_tx_pipeline_loop<PipelineFn, ThreadLocalCreatorFn, ThreadLocal>(
     }
 }
 
-fn tx_pipeline_loop<PipelineFn, ThreadLocal>(
+fn tx_pipeline_loop<PipelineFn, PipelineFnError, ThreadLocal>(
     tx_port_id: PortId,
     tx_queue_id: PortQueueId,
     batch_size: usize,
     delay: Option<Duration>,
     pipeline_fn: PipelineFn,
     mut thread_locals: ThreadLocal,
-    shutdown_listener: Listener
+    shutdown_listener: Listener,
 ) where
-    PipelineFn: Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf> + Clone + Send + Sync + 'static,
-    ThreadLocal: Send + 'static
+    PipelineFnError: Error,
+    PipelineFn:
+        Fn(Mbuf, &mut ThreadLocal) -> Result<Mbuf, PipelineFnError> + Clone + Send + Sync + 'static,
+    ThreadLocal: Send + 'static,
 {
     let txq = PortTxQueue::new(tx_port_id, tx_queue_id);
 
     while !shutdown_listener.is_triggered() {
         match Mbuf::alloc_bulk(batch_size) {
-            Ok(mbufs) => {
-                txq.transmit(
-                    mbufs
-                        .into_iter()
-                        .map(|mbuf| -> Result<Mbuf> {
-                            pipeline_fn(mbuf, &mut thread_locals)
-                        })
-                        .filter_map(|res| res.ok())
-                        .collect()
-                )
-            },
-            Err(e) => error!(?e)
+            Ok(mbufs) => txq.transmit(
+                mbufs
+                    .into_iter()
+                    .map(|mbuf| pipeline_fn(mbuf, &mut thread_locals))
+                    .filter_map(|res| res.ok())
+                    .collect(),
+            ),
+            Err(e) => error!(?e),
         }
         if let Some(dur) = delay {
             sleep(dur);
@@ -382,20 +450,20 @@ impl PortTxQueue {
         return Self {
             port_id,
             queue_id,
-            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].tx
+            stats: &PORT_QUEUE_STATS[port_id.id() as usize][queue_id.id() as usize].tx,
         };
         #[cfg(not(feature = "metrics"))]
-        return Self {
-            port_id,
-            queue_id,
-        };
+        return Self { port_id, queue_id };
     }
 
     /// Transmits a burst of packets.
     ///
     /// If the TX is full, the excess packets are dropped.
     pub(crate) fn transmit(&self, mbufs: Vec<Mbuf>) {
-        let mut mbuf_ptrs: Vec<MbufPtr> = mbufs.into_iter().map(move |mbuf| mbuf.into_easyptr()).collect();
+        let mut mbuf_ptrs: Vec<MbufPtr> = mbufs
+            .into_iter()
+            .map(move |mbuf| mbuf.into_easyptr())
+            .collect();
         self.transmit_ptrs(&mut mbuf_ptrs)
     }
 
@@ -407,7 +475,9 @@ impl PortTxQueue {
         if !mbufs.is_empty() {
             #[cfg(feature = "metrics")]
             // Record the number of mbufs dropped because of full TX queue
-            self.stats.cnt_excess_drop.fetch_add(mbufs.len() as u64, Ordering::Relaxed);
+            self.stats
+                .cnt_excess_drop
+                .fetch_add(mbufs.len() as u64, Ordering::Relaxed);
             // tx queue is full, we have to drop the excess.
             dpdk::pktmbuf_free_bulk(mbufs);
         }
@@ -424,8 +494,8 @@ impl PortMap {
     /// # Errors
     ///
     /// Returns `PortError::NotFound` if the port name is not found.
-    pub fn get(&self, name: &str) -> Result<&Port> {
-        self.0.get(name).ok_or_else(|| PortError::NotFound.into())
+    pub fn get(&self, name: &str) -> Result<&Port, PortError> {
+        self.0.get(name).ok_or_else(|| PortError::NotFound)
     }
 
     /// Returns a port iterator.
@@ -449,36 +519,6 @@ impl From<Vec<Port>> for PortMap {
     }
 }
 
-/// Port related errors.
-#[derive(Debug, Error)]
-pub enum PortError {
-    /// The port is not found.
-    #[error("port not found.")]
-    NotFound,
-
-    /// The maximum number of RX queues is less than the number of queues
-    /// requested.
-    #[error("insufficient number of receive queues. max is {0}.")]
-    InsufficientRxQueues(u16),
-
-    /// The maximum number of TX queues is less than the number of queues
-    /// requested.
-    #[error("insufficient number of transmit queues. max is {0}.")]
-    InsufficientTxQueues(u16),
-
-    /// The port has no lcores
-    #[error("receive not enabled on port.")]
-    NoLCores,
-
-    /// The pipeline for the port is already set.
-    #[error("pipeline already set.")]
-    PipelineSet,
-
-    /// Symmetric RSS cannot be disabled
-    #[error("symmetric RSS cannot be disabled")]
-    SymRSSNoDisable,
-}
-
 /// Port builder.
 pub(crate) struct Builder {
     name: String,
@@ -488,7 +528,7 @@ pub(crate) struct Builder {
     lcores: Vec<usize>,
     rxqs: usize,
     txqs: usize,
-    symmetric_rss: bool
+    symmetric_rss: bool,
 }
 
 impl Builder {
@@ -505,7 +545,7 @@ impl Builder {
     pub(crate) fn for_device<S1: Into<String>, S2: Into<String>>(
         name: S1,
         device: S2,
-    ) -> Result<Self> {
+    ) -> Result<Self, PortError> {
         let name: String = name.into();
         let device: String = device.into();
 
@@ -522,7 +562,7 @@ impl Builder {
             lcores: vec![],
             rxqs: port_info.rx_desc_lim.nb_min as usize,
             txqs: port_info.tx_desc_lim.nb_min as usize,
-            symmetric_rss: false
+            symmetric_rss: false,
         })
     }
 
@@ -535,7 +575,7 @@ impl Builder {
     ///
     /// Returns `PortError` if the maximum number of RX or TX queues is less than
     /// the number of lcores assigned.
-    pub(crate) fn set_lcores(&mut self, lcores: Vec<usize>) -> Result<&mut Self> {
+    pub(crate) fn set_lcores(&mut self, lcores: Vec<usize>) -> Result<&mut Self, PortError> {
         ensure!(
             self.port_info.max_rx_queues >= lcores.len() as u16,
             PortError::InsufficientRxQueues(self.port_info.max_rx_queues)
@@ -573,7 +613,11 @@ impl Builder {
     /// # Errors
     ///
     /// Returns `DpdkError` if failed to set the queue capacity.
-    pub(crate) fn set_rxqs_txqs(&mut self, rxqs: usize, txqs: usize) -> Result<&mut Self> {
+    pub(crate) fn set_rxqs_txqs(
+        &mut self,
+        rxqs: usize,
+        txqs: usize,
+    ) -> Result<&mut Self, PortError> {
         let (rxqs2, txqs2) = dpdk::eth_dev_adjust_nb_rx_tx_desc(self.port_id, rxqs, txqs)?;
 
         info!(
@@ -601,7 +645,7 @@ impl Builder {
     /// # Errors
     ///
     /// Returns `DpdkError` if the device does not support configurable mode.
-    pub(crate) fn set_promiscuous(&mut self, enable: bool) -> Result<&mut Self> {
+    pub(crate) fn set_promiscuous(&mut self, enable: bool) -> Result<&mut Self, PortError> {
         if enable {
             dpdk::eth_promiscuous_enable(self.port_id)?;
             debug!(port = ?self.name, "promiscuous mode enabled.");
@@ -618,7 +662,7 @@ impl Builder {
     /// # Errors
     ///
     /// Returns `DpdkError` if the device does not support configurable mode.
-    pub(crate) fn set_multicast(&mut self, enable: bool) -> Result<&mut Self> {
+    pub(crate) fn set_multicast(&mut self, enable: bool) -> Result<&mut Self, PortError> {
         if enable {
             dpdk::eth_allmulticast_enable(self.port_id)?;
             debug!(port = ?self.name, "multicast mode enabled.");
@@ -635,7 +679,10 @@ impl Builder {
     /// # Errors
     ///
     /// Returns `PortError` if RX has not been enabled yet or an attempt is made to disable the feature
-    pub(crate) fn set_symmetric_rss(&mut self, enable: bool) -> Result<&mut Self> {
+    pub(crate) fn set_symmetric_rss(
+        &mut self,
+        enable: bool,
+    ) -> core::result::Result<&mut Self, PortError> {
         ensure!(self.lcores.len() != 0, PortError::NoLCores);
         ensure!(enable, PortError::SymRSSNoDisable);
         if self.lcores.len() > 1 {
@@ -653,7 +700,7 @@ impl Builder {
     ///
     /// Returns `DpdkError` if fails to configure the device or any of the
     /// rx and tx queues.
-    pub(crate) fn build(&mut self, mempool: &mut Mempool) -> Result<Port> {
+    pub(crate) fn build(&mut self, mempool: &mut Mempool) -> Result<Port, PortError> {
         // turns on optimization for mbuf fast free.
         if self.port_info.tx_offload_capa & cffi::DEV_TX_OFFLOAD_MBUF_FAST_FREE as u64 > 0 {
             self.port_conf.txmode.offloads |= cffi::DEV_TX_OFFLOAD_MBUF_FAST_FREE as u64;
@@ -695,14 +742,13 @@ impl Builder {
 
         // configures symmetric RSS (this has to be done after configuring the port so the max queue size is known)
         if self.symmetric_rss {
-            dpdk::eth_sym_rss_enable(self.port_id,
-                                     self.lcores.len())?;
+            dpdk::eth_sym_rss_enable(self.port_id, self.lcores.len())?;
         }
 
         Ok(Port {
             name: self.name.clone(),
             port_id: self.port_id,
-            lcores: self.lcores.clone()
+            lcores: self.lcores.clone(),
         })
     }
 }
@@ -718,8 +764,8 @@ mod tests {
     }
 
     #[capsule::test]
-    fn set_lcores() -> Result<()> {
-        let mut builder = Builder::for_device("test0", "net_ring0")?;
+    fn set_lcores() {
+        let mut builder = Builder::for_device("test0", "net_ring0").unwrap();
 
         // ring port has a max rxq of 16.
         let lcores = (0..17).collect::<Vec<_>>();
@@ -732,88 +778,81 @@ mod tests {
             cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS,
             builder.port_conf.rxmode.mq_mode
         );
-
-        Ok(())
     }
 
     #[capsule::test]
-    fn set_rxqs_txqs() -> Result<()> {
-        let mut builder = Builder::for_device("test0", "net_ring0")?;
+    fn set_rxqs_txqs() {
+        let mut builder = Builder::for_device("test0", "net_ring0").unwrap();
 
         // unfortunately can't test boundary adjustment
         assert!(builder.set_rxqs_txqs(32, 32).is_ok());
         assert_eq!(32, builder.rxqs);
         assert_eq!(32, builder.txqs);
-
-        Ok(())
     }
 
     #[capsule::test]
-    fn set_promiscuous() -> Result<()> {
-        let mut builder = Builder::for_device("test0", "net_tap0")?;
+    fn set_promiscuous() {
+        let mut builder = Builder::for_device("test0", "net_tap0").unwrap();
 
         assert!(builder.set_promiscuous(true).is_ok());
         assert!(builder.set_promiscuous(false).is_ok());
-
-        Ok(())
     }
 
     #[capsule::test]
-    fn set_multicast() -> Result<()> {
-        let mut builder = Builder::for_device("test0", "net_tap0")?;
+    fn set_multicast() {
+        let mut builder = Builder::for_device("test0", "net_tap0").unwrap();
 
         assert!(builder.set_multicast(true).is_ok());
         assert!(builder.set_multicast(false).is_ok());
-
-        Ok(())
     }
 
     #[capsule::test]
-    fn build_port() -> Result<()> {
+    fn build_port() {
         let lcores = (0..2).collect::<Vec<_>>();
-        let mut pool = Mempool::new("mp_build_port", 15, 0, SocketId::ANY)?;
+        let mut pool = Mempool::new("mp_build_port", 15, 0, SocketId::ANY).unwrap();
         let port = Builder::for_device("test0", "net_ring0")?
-            .set_lcores(lcores.clone())?
-            .build(&mut pool)?;
+            .set_lcores(lcores.clone())
+            .unwrap()
+            .build(&mut pool)
+            .unwrap();
 
         assert_eq!("test0", port.name());
         assert!(port.promiscuous());
         assert!(port.multicast());
         assert_eq!(lcores, port.lcores);
-
-        Ok(())
     }
 
     #[capsule::test]
-    fn symmetric_rss() -> Result<()> {
+    fn symmetric_rss() {
         let lcores = (0..2).collect::<Vec<_>>();
-        let mut pool = Mempool::new("mp_build_port_sym_rss", 15, 0, SocketId::ANY)?;
-        let _port = Builder::for_device("test0", "net_ring0")?
-            .set_lcores(lcores.clone())?
-            .set_symmetric_rss(true)?
-            .build(&mut pool)?;
-        Ok(())
+        let mut pool = Mempool::new("mp_build_port_sym_rss", 15, 0, SocketId::ANY).unwrap();
+        let _port = Builder::for_device("test0", "net_ring0")
+            .unwrap()
+            .set_lcores(lcores.clone())
+            .unwrap()
+            .set_symmetric_rss(true)
+            .unwrap()
+            .build(&mut pool)
+            .unwrap();
     }
 
     #[capsule::test]
-    fn port_rx() -> Result<()> {
-        let mut pool = Mempool::new("mp_port_rx", 15, 0, SocketId::ANY)?;
-        let port = Builder::for_device("test0", "net_null0")?
-            .set_lcores(vec![0])?
-            .build(&mut pool)?;
+    fn port_rx() {
+        let mut pool = Mempool::new("mp_port_rx", 15, 0, SocketId::ANY).unwrap();
+        let port = Builder::for_device("test0", "net_null0")
+            .unwrap()
+            .set_lcores(vec![0])
+            .unwrap()
+            .build(&mut pool)
+            .unwrap();
 
         let mut packets = Vec::with_capacity(4);
         assert_eq!(0, packets.len());
 
-        let rxq = PortRxQueue::new(
-            port.port_id,
-            0.into(),
-        );
+        let rxq = PortRxQueue::new(port.port_id, 0.into());
 
         rxq.receive(&mut packets);
         assert_eq!(4, packets.len());
         assert_eq!(4, dpdk::mempool_in_use_count(pool.ptr_mut()));
-
-        Ok(())
     }
 }

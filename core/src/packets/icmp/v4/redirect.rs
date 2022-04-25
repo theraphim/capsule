@@ -17,9 +17,9 @@
 */
 
 use crate::packets::icmp::v4::{Icmpv4, Icmpv4Message, Icmpv4Packet, Icmpv4Type, Icmpv4Types};
+use crate::packets::icmp::IcmpError;
 use crate::packets::ip::v4::IPV4_MIN_MTU;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{Result, Error};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::ptr::NonNull;
@@ -111,6 +111,8 @@ impl fmt::Debug for Redirect {
 }
 
 impl Icmpv4Message for Redirect {
+    type Error = IcmpError;
+
     #[inline]
     fn msg_type() -> Icmpv4Type {
         Icmpv4Types::Redirect
@@ -146,12 +148,12 @@ impl Icmpv4Message for Redirect {
     /// Returns an error if the payload does not have sufficient data for
     /// the redirect message body.
     #[inline]
-    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self, (Error, Icmpv4)> {
+    fn try_parse(icmp: Icmpv4, _internal: Internal) -> Result<Self, (Self::Error, Icmpv4)> {
         let mbuf = icmp.mbuf();
         let offset = icmp.payload_offset();
         let body = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, icmp)),
-            Ok(body) => body
+            Err(e) => return Err((e.into(), icmp)),
+            Ok(body) => body,
         };
 
         Ok(Redirect { icmp, body })
@@ -164,7 +166,7 @@ impl Icmpv4Message for Redirect {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    fn try_push(mut icmp: Icmpv4, _internal: Internal) -> Result<Self> {
+    fn try_push(mut icmp: Icmpv4, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = icmp.payload_offset();
         let mbuf = icmp.mbuf_mut();
 

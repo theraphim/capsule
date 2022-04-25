@@ -16,22 +16,24 @@
 * SPDX-License-Identifier: Apache-2.0
 */
 
-use crate::ffi::dpdk::{self, MbufPtr};
+use crate::ffi::dpdk::{self, DpdkError, MbufPtr};
 use crate::packets::{Internal, Packet, SizeOf};
 use crate::runtime::Mempool;
 use crate::{ensure, trace};
-use anyhow::{Result, Error};
+use capsule::runtime::MempoolError;
 use capsule_ffi as cffi;
+use std::cmp::min;
 use std::fmt;
 use std::mem;
-use std::cmp::min;
 use std::ptr::{self, NonNull};
 use std::slice;
 use thiserror::Error;
 
-/// Error indicating buffer access failures.
 #[derive(Debug, Error)]
-pub(crate) enum BufferError {
+pub enum MbufError {
+    #[error("Mempool error")]
+    MempoolError(#[from] MempoolError),
+
     /// The offset exceeds the buffer length.
     #[error("Offset {0} exceeds the buffer length {1}.")]
     BadOffset(usize, usize),
@@ -43,6 +45,9 @@ pub(crate) enum BufferError {
     /// The struct size exceeds the remaining buffer length.
     #[error("Struct size {0} exceeds the remaining buffer length {1}.")]
     OutOfBuffer(usize, usize),
+
+    #[error("DPDK error")]
+    DpdkError(#[from] DpdkError),
 }
 
 /// A DPDK message buffer that carries the network packet.
@@ -95,7 +100,7 @@ impl Mbuf {
     /// Returns `MempoolPtrUnsetError` if invoked from a non lcore.
     /// Returns `DpdkError` if the allocation of mbuf fails.
     #[inline]
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Result<Self, MbufError> {
         let mut mp = Mempool::thread_local_ptr()?;
         let ptr = dpdk::pktmbuf_alloc(&mut mp)?;
 
@@ -109,10 +114,10 @@ impl Mbuf {
     /// # Errors
     ///
     /// Returns `DpdkError` if the allocation of mbuf fails.
-    /// Returns `BufferError::NotResized` if the byte array is larger than
+    /// Returns `MbufError::NotResized` if the byte array is larger than
     /// the maximum mbuf size.
     #[inline]
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, MbufError> {
         let mut mbuf = Mbuf::new()?;
         mbuf.extend(0, data.len())?;
         mbuf.write_data_slice(0, data)?;
@@ -166,14 +171,14 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::NotResized` if the offset is out of bound,
+    /// Returns `MbufError::NotResized` if the offset is out of bound,
     /// or the length to extend is either 0 or exceeds the available free
     /// buffer capacity.
     #[inline]
-    pub fn extend(&mut self, offset: usize, len: usize) -> Result<()> {
-        ensure!(len > 0, BufferError::NotResized);
-        ensure!(offset <= self.data_len(), BufferError::NotResized);
-        ensure!(len < self.tailroom(), BufferError::NotResized);
+    pub fn extend(&mut self, offset: usize, len: usize) -> Result<(), MbufError> {
+        ensure!(len > 0, MbufError::NotResized);
+        ensure!(offset <= self.data_len(), MbufError::NotResized);
+        ensure!(len < self.tailroom(), MbufError::NotResized);
 
         // shifts down data to make room
         let to_copy = self.data_len() - offset;
@@ -198,12 +203,12 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::NotResized` if the length to shrink is either
+    /// Returns `MbufError::NotResized` if the length to shrink is either
     /// 0 or exceeds the used buffer size starting at offset.
     #[inline]
-    pub fn shrink(&mut self, offset: usize, len: usize) -> Result<()> {
-        ensure!(len > 0, BufferError::NotResized);
-        ensure!(offset + len <= self.data_len(), BufferError::NotResized);
+    pub fn shrink(&mut self, offset: usize, len: usize) -> Result<(), MbufError> {
+        ensure!(len > 0, MbufError::NotResized);
+        ensure!(offset + len <= self.data_len(), MbufError::NotResized);
 
         // shifts up data to fill the room
         let to_copy = self.data_len() - offset - len;
@@ -226,7 +231,7 @@ impl Mbuf {
     ///
     /// Delegates to either `extend` or `shrink`.
     #[inline]
-    pub fn resize(&mut self, offset: usize, len: isize) -> Result<()> {
+    pub fn resize(&mut self, offset: usize, len: isize) -> Result<(), MbufError> {
         if len < 0 {
             self.shrink(offset, -len as usize)
         } else {
@@ -238,9 +243,12 @@ impl Mbuf {
     ///
     /// Delegates to `resize` with the `offset` being the tail of the resized buffer (`len`).
     #[inline]
-    pub fn resize_to(&mut self, len: usize) -> Result<()> {
+    pub fn resize_to(&mut self, len: usize) -> Result<(), MbufError> {
         if self.data_len() != len {
-            self.resize(min(self.data_len(), len), len as isize - self.data_len() as isize)?
+            self.resize(
+                min(self.data_len(), len),
+                len as isize - self.data_len() as isize,
+            )?
         }
         Ok(())
     }
@@ -249,11 +257,11 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::NotResized` if the target length exceeds the
+    /// Returns `MbufError::NotResized` if the target length exceeds the
     /// actual used buffer size.
     #[inline]
-    pub fn truncate(&mut self, to_len: usize) -> Result<()> {
-        ensure!(to_len < self.data_len(), BufferError::NotResized);
+    pub fn truncate(&mut self, to_len: usize) -> Result<(), MbufError> {
+        ensure!(to_len < self.data_len(), MbufError::NotResized);
 
         self.raw_mut().data_len = to_len as u16;
         self.raw_mut().pkt_len = to_len as u32;
@@ -265,18 +273,18 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::BadOffset` if the offset is out of bound.
-    /// Returns `BufferError::OutOfBuffer` if the size of `T` exceeds the
+    /// Returns `MbufError::BadOffset` if the offset is out of bound.
+    /// Returns `MbufError::OutOfBuffer` if the size of `T` exceeds the
     /// size of the data stored at offset.
     #[inline]
-    pub fn read_data<T: SizeOf>(&self, offset: usize) -> Result<NonNull<T>> {
+    pub fn read_data<T: SizeOf>(&self, offset: usize) -> Result<NonNull<T>, MbufError> {
         ensure!(
             offset < self.data_len(),
-            BufferError::BadOffset(offset, self.data_len())
+            MbufError::BadOffset(offset, self.data_len())
         );
         ensure!(
             offset + T::size_of() <= self.data_len(),
-            BufferError::OutOfBuffer(T::size_of(), self.data_len() - offset)
+            MbufError::OutOfBuffer(T::size_of(), self.data_len() - offset)
         );
 
         unsafe {
@@ -294,13 +302,17 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::OutOfBuffer` if the size of `T` exceeds the
+    /// Returns `MbufError::OutOfBuffer` if the size of `T` exceeds the
     /// available buffer capacity starting at offset.
     #[inline]
-    pub fn write_data<T: SizeOf>(&mut self, offset: usize, item: &T) -> Result<NonNull<T>> {
+    pub fn write_data<T: SizeOf>(
+        &mut self,
+        offset: usize,
+        item: &T,
+    ) -> Result<NonNull<T>, MbufError> {
         ensure!(
             offset + T::size_of() <= self.data_len(),
-            BufferError::OutOfBuffer(T::size_of(), self.data_len() - offset)
+            MbufError::OutOfBuffer(T::size_of(), self.data_len() - offset)
         );
 
         unsafe {
@@ -317,18 +329,22 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::BadOffset` if the offset is out of bound.
-    /// Returns `BufferError::OutOfBuffer` if the size of `T` slice exceeds
+    /// Returns `MbufError::BadOffset` if the offset is out of bound.
+    /// Returns `MbufError::OutOfBuffer` if the size of `T` slice exceeds
     /// the size of the data stored at offset.
     #[inline]
-    pub fn read_data_slice<T: SizeOf>(&self, offset: usize, count: usize) -> Result<NonNull<[T]>> {
+    pub fn read_data_slice<T: SizeOf>(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<NonNull<[T]>, MbufError> {
         ensure!(
             offset < self.data_len(),
-            BufferError::BadOffset(offset, self.data_len())
+            MbufError::BadOffset(offset, self.data_len())
         );
         ensure!(
             offset + T::size_of() * count <= self.data_len(),
-            BufferError::OutOfBuffer(T::size_of() * count, self.data_len() - offset)
+            MbufError::OutOfBuffer(T::size_of() * count, self.data_len() - offset)
         );
 
         unsafe {
@@ -347,19 +363,19 @@ impl Mbuf {
     ///
     /// # Errors
     ///
-    /// Returns `BufferError::OutOfBuffer` if the size of `T` slice exceeds
+    /// Returns `MbufError::OutOfBuffer` if the size of `T` slice exceeds
     /// the available buffer capacity starting at offset.
     #[inline]
     pub fn write_data_slice<T: SizeOf>(
         &mut self,
         offset: usize,
         slice: &[T],
-    ) -> Result<NonNull<[T]>> {
+    ) -> Result<NonNull<[T]>, MbufError> {
         let count = slice.len();
 
         ensure!(
             offset + T::size_of() * count <= self.data_len(),
-            BufferError::OutOfBuffer(T::size_of() * count, self.data_len() - offset)
+            MbufError::OutOfBuffer(T::size_of() * count, self.data_len() - offset)
         );
 
         unsafe {
@@ -387,7 +403,7 @@ impl Mbuf {
     /// # Errors
     ///
     /// Returns `DpdkError` if the allocation of mbuf fails.
-    pub fn alloc_bulk(len: usize) -> Result<Vec<Mbuf>> {
+    pub fn alloc_bulk(len: usize) -> Result<Vec<Mbuf>, MbufError> {
         let mut ptrs = Vec::with_capacity(len);
         let mut mp = Mempool::thread_local_ptr()?;
         dpdk::pktmbuf_alloc_bulk(&mut mp, &mut ptrs)?;
@@ -445,6 +461,7 @@ impl Packet for Mbuf {
     // `Mbuf` does not have a conceptual envelope. However, we need to define
     // it this way to implement the trait.
     type Envelope = Mbuf;
+    type Error = MbufError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -485,12 +502,15 @@ impl Packet for Mbuf {
     }
 
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         Ok(envelope)
     }
 
     #[inline]
-    fn try_push(envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         Ok(envelope)
     }
 
@@ -500,7 +520,7 @@ impl Packet for Mbuf {
     }
 
     #[inline]
-    fn remove(self) -> Result<Self::Envelope> {
+    fn remove(self) -> Result<Self::Envelope, Self::Error> {
         Ok(self)
     }
 
@@ -656,7 +676,7 @@ mod tests {
         // read from the wrong offset should return junk
         let item = mbuf.read_data::<[u8; 16]>(2).unwrap();
         let item = unsafe { item.as_ref() };
-        assert!(BUFFER != *item);
+        assert_ne!(BUFFER, *item);
 
         // read exceeds buffer should err
         assert!(mbuf.read_data::<[u8; 16]>(10).is_err());
@@ -677,7 +697,7 @@ mod tests {
         // read from the wrong offset should return junk
         let slice = mbuf.read_data_slice::<u8>(2, 16).unwrap();
         let slice = unsafe { slice.as_ref() };
-        assert!(BUFFER != *slice);
+        assert_ne!(BUFFER, *slice);
 
         // read exceeds buffer should err
         assert!(mbuf.read_data_slice::<u8>(10, 16).is_err());

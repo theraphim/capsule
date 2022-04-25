@@ -19,13 +19,15 @@
 use crate::ensure;
 use crate::packets::checksum::PseudoHeader;
 use crate::packets::ip::v6::Ipv6Packet;
-use crate::packets::ip::{IpPacket, ProtocolNumber, ProtocolNumbers};
+use crate::packets::ip::{
+    IpError, IpPacket, IpProtocolSpecificError, ProtocolNumber, ProtocolNumbers,
+};
 use crate::packets::types::u16be;
 use crate::packets::{Internal, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ptr::NonNull;
+use thiserror::Error;
 
 /// IPv6 Segment Routing based on [IETF DRAFT].
 ///
@@ -106,6 +108,22 @@ pub struct SegmentRouting<E: Ipv6Packet> {
     segments: NonNull<[Ipv6Addr]>,
     offset: usize,
 }
+
+#[derive(Error, Debug)]
+pub enum SegmentRoutingError {
+    /* #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("ip packet error")]
+    IpPacketError(#[from] IpError), */
+    #[error("not an IPv6 segment routing packet: {0:?}")]
+    InvalidPacketType(ProtocolNumber),
+    #[error("segment list length must be greater than 0")]
+    InvalidSegmentListLength,
+    #[error("packet has inconsistent segment list length")]
+    InconsistentSegmentListLength,
+}
+
+// impl IpPacketError for SegmentRoutingError {}
 
 impl<E: Ipv6Packet> SegmentRouting<E> {
     #[inline]
@@ -207,7 +225,7 @@ impl<E: Ipv6Packet> SegmentRouting<E> {
     /// Returns an error if the segments length is 0. Returns an error if the
     /// buffer does not have enough free space for the segments.
     #[inline]
-    pub fn set_segments(&mut self, segments: &[Ipv6Addr]) -> Result<()> {
+    pub fn set_segments(&mut self, segments: &[Ipv6Addr]) -> Result<(), IpError> {
         if !segments.is_empty() {
             let old_len = self.last_entry() + 1;
             let new_len = segments.len() as u8;
@@ -228,7 +246,10 @@ impl<E: Ipv6Packet> SegmentRouting<E> {
             self.set_last_entry(new_len - 1);
             Ok(())
         } else {
-            Err(anyhow!("segment list length must be greater than 0."))
+            Err(
+                IpProtocolSpecificError::V6(SegmentRoutingError::InvalidSegmentListLength.into())
+                    .into(),
+            )
         }
     }
 }
@@ -254,6 +275,7 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
     /// The preceding type for an IPv6 segment routing packet can be either
     /// an IPv6 packet or any possible IPv6 extension packets.
     type Envelope = E;
+    type Error = IpError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -296,17 +318,26 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Route`]: ProtocolNumbers::Ipv6Route
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         ensure!(
             envelope.next_header() == ProtocolNumbers::Ipv6Route,
-            (anyhow!("not an IPv6 routing packet."), envelope)
+            (
+                IpProtocolSpecificError::V6(
+                    SegmentRoutingError::InvalidPacketType(envelope.next_header()).into()
+                )
+                .into(),
+                envelope
+            )
         );
 
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data::<SegmentRoutingHeader>(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         let hdr_ext_len = unsafe { header.as_ref().hdr_ext_len };
@@ -317,8 +348,8 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
                 offset + SegmentRoutingHeader::size_of(),
                 segments_len as usize,
             ) {
-                Err(e) => return Err((e, envelope)),
-                Ok(segments) => segments
+                Err(e) => return Err((e.into(), envelope)),
+                Ok(segments) => segments,
             };
 
             Ok(SegmentRouting {
@@ -328,7 +359,13 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
                 offset,
             })
         } else {
-            Err((anyhow!("Packet has inconsistent segment list length."), envelope))
+            Err((
+                IpProtocolSpecificError::V6(
+                    SegmentRoutingError::InconsistentSegmentListLength.into(),
+                )
+                .into(),
+                envelope,
+            ))
         }
     }
 
@@ -345,7 +382,7 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
     /// [`next_header`]: Ipv6Packet::next_header
     /// [`ProtocolNumbers::Ipv6Route`]: ProtocolNumbers::Ipv6Route
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
@@ -387,7 +424,7 @@ impl<E: Ipv6Packet> Packet for SegmentRouting<E> {
     ///
     /// [`next_header`]: Ipv6Packet::next_header
     #[inline]
-    fn remove(mut self) -> Result<Self::Envelope> {
+    fn remove(mut self) -> Result<Self::Envelope, Self::Error> {
         let offset = self.offset();
         let len = self.header_len();
         let next_header = self.next_header();
@@ -419,7 +456,7 @@ impl<E: Ipv6Packet> IpPacket for SegmentRouting<E> {
     }
 
     #[inline]
-    fn set_src(&mut self, src: IpAddr) -> Result<()> {
+    fn set_src(&mut self, src: IpAddr) -> Result<(), IpError> {
         self.envelope_mut().set_src(src)
     }
 
@@ -429,7 +466,7 @@ impl<E: Ipv6Packet> IpPacket for SegmentRouting<E> {
     }
 
     #[inline]
-    fn set_dst(&mut self, dst: IpAddr) -> Result<()> {
+    fn set_dst(&mut self, dst: IpAddr) -> Result<(), IpError> {
         if let IpAddr::V6(v6_dst) = dst {
             let mut segments = vec![v6_dst];
             for segment in self.segments().iter().skip(1) {
@@ -479,7 +516,7 @@ impl<E: Ipv6Packet> IpPacket for SegmentRouting<E> {
     }
 
     #[inline]
-    fn truncate(&mut self, mtu: usize) -> Result<()> {
+    fn truncate(&mut self, mtu: usize) -> Result<(), IpError> {
         self.envelope_mut().truncate(mtu)
     }
 }

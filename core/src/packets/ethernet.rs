@@ -21,10 +21,10 @@
 use crate::ensure;
 use crate::net::MacAddr;
 use crate::packets::types::u16be;
-use crate::packets::{Internal, Mbuf, Packet, SizeOf};
-use anyhow::{anyhow, Result, Error};
+use crate::packets::{Internal, Mbuf, MbufError, Packet, SizeOf};
 use std::fmt;
 use std::ptr::NonNull;
+use thiserror::Error;
 
 const ETH_HEADER_SIZE: usize = 14;
 
@@ -228,9 +228,18 @@ impl fmt::Debug for Ethernet {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum EthernetError {
+    #[error("mbuf error")]
+    MbufError(#[from] MbufError),
+    #[error("header size exceeds remaining buffer size")]
+    HeaderTooLong,
+}
+
 impl Packet for Ethernet {
     /// The preceding type for Ethernet must be `Mbuf`.
     type Envelope = Mbuf;
+    type Error = EthernetError;
 
     #[inline]
     fn envelope(&self) -> &Self::Envelope {
@@ -277,12 +286,15 @@ impl Packet for Ethernet {
     /// Returns an error if the `Ethernet` header is larger than the data
     /// payload.
     #[inline]
-    fn try_parse(envelope: Self::Envelope, _internal: Internal) -> Result<Self, (Error, Self::Envelope)> {
+    fn try_parse(
+        envelope: Self::Envelope,
+        _internal: Internal,
+    ) -> Result<Self, (Self::Error, Self::Envelope)> {
         let mbuf = envelope.mbuf();
         let offset = envelope.payload_offset();
         let header = match mbuf.read_data(offset) {
-            Err(e) => return Err((e, envelope)),
-            Ok(header) => header
+            Err(e) => return Err((e.into(), envelope)),
+            Ok(header) => header,
         };
 
         let packet = Ethernet {
@@ -297,7 +309,7 @@ impl Packet for Ethernet {
         // header will cause a panic.
         ensure!(
             packet.mbuf().data_len() >= packet.header_len(),
-            (anyhow!("header size exceeds remaining buffer size."), packet.deparse())
+            (EthernetError::HeaderTooLong, packet.deparse())
         );
 
         Ok(packet)
@@ -309,7 +321,7 @@ impl Packet for Ethernet {
     ///
     /// Returns an error if the buffer does not have enough free space.
     #[inline]
-    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self> {
+    fn try_push(mut envelope: Self::Envelope, _internal: Internal) -> Result<Self, Self::Error> {
         let offset = envelope.payload_offset();
         let mbuf = envelope.mbuf_mut();
 
