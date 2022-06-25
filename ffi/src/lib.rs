@@ -35,3 +35,5 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 #[cfg(feature = "rustdoc")]
 include!("bindings_rustdoc.rs");
+
+pub const RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE: u64 = 1 << 16;

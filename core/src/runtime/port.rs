@@ -545,21 +545,21 @@ impl Builder {
             PortError::InsufficientTxQueues(self.port_info.max_tx_queues)
         );
 
-        if lcores.len() > 1 {
-            const RSS_HF: u64 =
-                (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
-                    as u64;
-            // enables receive side scaling.
-            self.port_conf.rxmode.mq_mode = cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS;
-            self.port_conf.rx_adv_conf.rss_conf.rss_hf =
-                self.port_info.flow_type_rss_offloads & RSS_HF;
+//        if lcores.len() > 1 {
+//            const RSS_HF: u64 =
+//                (cffi::ETH_RSS_IP | cffi::ETH_RSS_TCP | cffi::ETH_RSS_UDP | cffi::ETH_RSS_SCTP)
+//                    as u64;
+//            // enables receive side scaling.
+//            self.port_conf.rxmode.mq_mode = cffi::rte_eth_rx_mq_mode::ETH_MQ_RX_RSS;
+//            self.port_conf.rx_adv_conf.rss_conf.rss_hf =
+//                self.port_info.flow_type_rss_offloads & RSS_HF;
 
-            debug!(
-                port = ?self.name,
-                rss_hf = self.port_conf.rx_adv_conf.rss_conf.rss_hf,
-                "receive side scaling enabled."
-            );
-        }
+//            debug!(
+//                port = ?self.name,
+//                rss_hf = self.port_conf.rx_adv_conf.rss_conf.rss_hf,
+//                "receive side scaling enabled."
+//            );
+  //      }
 
         self.lcores = lcores;
         Ok(self)
@@ -655,8 +655,8 @@ impl Builder {
     /// rx and tx queues.
     pub(crate) fn build(&mut self, mempool: &mut Mempool) -> Result<Port> {
         // turns on optimization for mbuf fast free.
-        if self.port_info.tx_offload_capa & cffi::DEV_TX_OFFLOAD_MBUF_FAST_FREE as u64 > 0 {
-            self.port_conf.txmode.offloads |= cffi::DEV_TX_OFFLOAD_MBUF_FAST_FREE as u64;
+        if self.port_info.tx_offload_capa & cffi::RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE as u64 > 0 {
+            self.port_conf.txmode.offloads |= cffi::RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE as u64;
             debug!(port = ?self.name, "mbuf fast free enabled.");
         }
 

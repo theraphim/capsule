@@ -267,7 +267,6 @@ where
 pub(crate) enum LcoreState {
     WAIT,
     RUNNING,
-    FINISHED,
 }
 
 impl TryFrom<cffi::rte_lcore_state_t::Type> for LcoreState {
@@ -277,7 +276,6 @@ impl TryFrom<cffi::rte_lcore_state_t::Type> for LcoreState {
         match value {
             cffi::rte_lcore_state_t::WAIT => Ok(LcoreState::WAIT),
             cffi::rte_lcore_state_t::RUNNING => Ok(LcoreState::RUNNING),
-            cffi::rte_lcore_state_t::FINISHED => Ok(LcoreState::FINISHED),
             _ => {
                 Err(anyhow!("Not a valid LCoreState"))
             }
@@ -489,30 +487,30 @@ fn eth_sym_rss_flow_rule_create(port_id: PortId, rss_hf: u64, proto_stack: Vec<c
 pub(crate) fn eth_sym_rss_enable(port_id: PortId, num_queues: usize) -> Result<()> {
     let specs = vec![
         // IPv4 UDP
-        (cffi::ETH_RSS_NONFRAG_IPV4_UDP,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV4_UDP,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
               cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
         // IPv4 TCP
-        (cffi::ETH_RSS_NONFRAG_IPV4_TCP,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV4_TCP,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4,
               cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
         // IPv4
-        (cffi::ETH_RSS_FRAG_IPV4,
+        (cffi::RTE_ETH_FLOW_FRAG_IPV4,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4]),
-        (cffi::ETH_RSS_NONFRAG_IPV4_OTHER,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV4_OTHER,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV4]),
         // IPv6 UDP
-        (cffi::ETH_RSS_NONFRAG_IPV6_UDP,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV6_UDP,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
               cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_UDP]),
         // IPv6 TCP
-        (cffi::ETH_RSS_NONFRAG_IPV6_TCP,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV6_TCP,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6,
               cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_TCP]),
         // IPv6
-        (cffi::ETH_RSS_FRAG_IPV6,
+        (cffi::RTE_ETH_FLOW_FRAG_IPV6,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
-        (cffi::ETH_RSS_NONFRAG_IPV6_OTHER,
+        (cffi::RTE_ETH_FLOW_NONFRAG_IPV6_OTHER,
          vec![cffi::rte_flow_item_type::RTE_FLOW_ITEM_TYPE_IPV6]),
     ];
     for (rss_hf, mut protos) in specs {

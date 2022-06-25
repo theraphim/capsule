@@ -37,8 +37,6 @@ const RTE_CORE_LIBS: &[&str] = &[
     "rte_cmdline",
     "rte_common_cpt",
     "rte_common_dpaax",
-    "rte_common_octeontx",
-    "rte_common_octeontx2",
     "rte_compressdev",
     "rte_cryptodev",
     "rte_distributor",
@@ -65,7 +63,6 @@ const RTE_CORE_LIBS: &[&str] = &[
     "rte_mempool_dpaa",
     "rte_mempool_dpaa2",
     "rte_mempool_octeontx",
-    "rte_mempool_octeontx2",
     "rte_mempool_ring",
     "rte_mempool_stack",
     "rte_meter",
@@ -79,9 +76,7 @@ const RTE_CORE_LIBS: &[&str] = &[
     "rte_rawdev",
     "rte_raw_dpaa2_cmdif",
     "rte_raw_dpaa2_qdma",
-    "rte_raw_ioat",
     "rte_raw_ntb",
-    "rte_raw_octeontx2_dma",
     "rte_raw_skeleton",
     "rte_rcu",
     "rte_reorder",
@@ -111,10 +106,10 @@ fn bind(path: &Path) {
         .generate_inline_functions(true)
         // treat as opaque as per issue w/ combining align/packed:
         // https://github.com/rust-lang/rust-bindgen/issues/1538
-        .opaque_type(r"rte_arp_ipv4|rte_arp_hdr")
-        .whitelist_type(r"(rte|eth|pcap)_.*")
-        .whitelist_function(r"(_rte|rte|eth|numa|pcap)_.*")
-        .whitelist_var(r"(RTE|DEV|ETH|MEMPOOL|PKT|rte)_.*")
+        .opaque_type(r"rte_arp_ipv4|rte_arp_hdr|rte_l2tpv2_combined_msg_hdr|rte_gtp_psc_generic_hdr")
+        .allowlist_type(r"(rte|eth|pcap)_.*")
+        .allowlist_function(r"(_rte|rte|eth|numa|pcap)_.*")
+        .allowlist_var(r"(RTE|DEV|ETH|MEMPOOL|PKT|rte)_.*")
         .derive_copy(true)
         .derive_debug(true)
         .derive_default(true)
