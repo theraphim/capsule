@@ -130,9 +130,19 @@ fn main() {
 
     bind(&out_path);
 
+    println!("cargo:rustc-link-search=/usr/local/lib64");
+
+    let core_linkage = match env::var("DPDK_STATIC_LINK") {
+        Ok(x) if x == "1" => "static",
+        _ => "dylib",
+    };
+
     RTE_CORE_LIBS
         .iter()
-        .chain(RTE_DEPS_LIBS)
+        .for_each(|lib| println!("cargo:rustc-link-lib={}={}", core_linkage, lib));
+
+    RTE_DEPS_LIBS
+        .iter()
         .for_each(|lib| println!("cargo:rustc-link-lib=dylib={}", lib));
 
     // re-run build.rs upon changes

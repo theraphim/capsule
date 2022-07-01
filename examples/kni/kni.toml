@@ -8,11 +8,13 @@ main_core = 0
 [[ports]]
     name = "cap0"
     device = "0000:00:08.0"
+    lcores = [1,2]
     rx_cores = [1]
     tx_cores = [2]
 
 [[ports]]
     name = "kni0"
     device = "net_kni0"
+    lcores = [1,2]
     rx_cores = [1]
     tx_cores = [2]
